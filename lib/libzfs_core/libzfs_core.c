@@ -1641,6 +1641,21 @@ lzc_rebase_find_ancestor(const char *base, const char *after,
 	return (error);
 }
 
+int
+lzc_rebase_enum_deltas(const char *base, const char *after, nvlist_t **outp)
+{
+	nvlist_t *args;
+	int error;
+
+	args = fnvlist_alloc();
+	fnvlist_add_string(args, "after_dataset", after);
+
+	error = lzc_ioctl(ZFS_IOC_REBASE_ENUM_DELTAS, base, args, outp);
+	fnvlist_free(args);
+
+	return (error);
+}
+
 /*
  * Destroys bookmarks.
  *

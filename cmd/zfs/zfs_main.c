@@ -4264,18 +4264,50 @@ zfs_do_rebase(int argc, char **argv)
 		usage(B_FALSE);
 	}
 
-	char ancestor[ZFS_MAX_DATASET_NAME_LEN];
-	int error = lzc_rebase_find_ancestor(argv[0], argv[1],
-	    ancestor, sizeof (ancestor));
+	nvlist_t *result = NULL;
+	int error = lzc_rebase_enum_deltas(argv[0], argv[1], &result);
 
 	if (error != 0) {
 		(void) fprintf(stderr,
-		    gettext("cannot find common ancestor: %s\n"),
+		    gettext("cannot enumerate rebase deltas: %s\n"),
 		    strerror(error));
 		return (1);
 	}
 
+	const char *ancestor = fnvlist_lookup_string(result, "ancestor");
 	(void) printf("common ancestor: %s\n", ancestor);
+
+	uint64_t *base_objs = NULL, *after_objs = NULL;
+	uint_t base_count = 0, after_count = 0;
+
+	(void) nvlist_lookup_uint64_array(result, "base_changed_objs",
+	    &base_objs, &base_count);
+	(void) nvlist_lookup_uint64_array(result, "after_changed_objs",
+	    &after_objs, &after_count);
+
+	(void) printf("base  (%s → %s): %u object(s) modified\n",
+	    ancestor, argv[0], base_count);
+	for (uint_t i = 0; i < base_count; i++)
+		(void) printf("  object %llu\n", (u_longlong_t)base_objs[i]);
+
+	(void) printf("after (%s → %s): %u object(s) modified\n",
+	    ancestor, argv[1], after_count);
+	for (uint_t i = 0; i < after_count; i++)
+		(void) printf("  object %llu\n", (u_longlong_t)after_objs[i]);
+
+	/* Compute intersection — potential conflicts */
+	uint_t conflicts = 0;
+	for (uint_t i = 0; i < base_count; i++) {
+		for (uint_t j = 0; j < after_count; j++) {
+			if (base_objs[i] == after_objs[j]) {
+				conflicts++;
+				break;
+			}
+		}
+	}
+	(void) printf("potential conflicts: %u object(s)\n", conflicts);
+
+	fnvlist_free(result);
 	return (0);
 }
 

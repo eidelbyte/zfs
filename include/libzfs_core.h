@@ -57,6 +57,8 @@ _LIBZFS_CORE_H int lzc_get_bookmark_props(const char *, nvlist_t **);
 _LIBZFS_CORE_H int lzc_get_dataset_props(const char *, nvlist_t *, nvlist_t **);
 _LIBZFS_CORE_H int lzc_rebase_find_ancestor(const char *, const char *,
     char *, size_t);
+_LIBZFS_CORE_H int lzc_rebase_enum_deltas(const char *, const char *,
+    nvlist_t **);
 _LIBZFS_CORE_H int lzc_destroy_bookmarks(nvlist_t *, nvlist_t **);
 _LIBZFS_CORE_H int lzc_load_key(const char *, boolean_t, uint8_t *, uint_t);
 _LIBZFS_CORE_H int lzc_unload_key(const char *);

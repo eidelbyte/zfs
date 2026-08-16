@@ -8107,6 +8107,81 @@ zfs_ioc_rebase_find_ancestor(const char *basename, nvlist_t *innvl,
 	return (error);
 }
 
+/*
+ * innvl: {
+ *     "after_dataset" -> name of the after (rebased) dataset
+ * }
+ *
+ * outnvl: {
+ *     "ancestor"          -> full name of the common ancestor snapshot
+ *     "base_changed_objs" -> uint64 array of object IDs modified on base
+ *     "after_changed_objs"-> uint64 array of object IDs modified on after
+ * }
+ */
+static const zfs_ioc_key_t zfs_keys_rebase_enum_deltas[] = {
+	{"after_dataset",	DATA_TYPE_STRING,	0},
+};
+
+static int
+zfs_ioc_rebase_enum_deltas(const char *basename, nvlist_t *innvl,
+    nvlist_t *outnvl)
+{
+	const char *aftername;
+	dsl_pool_t *dp;
+	dsl_dataset_t *base_ds, *after_ds, *ancestor;
+	char ancestor_name[ZFS_MAX_DATASET_NAME_LEN];
+	uint64_t *base_objs = NULL, *after_objs = NULL;
+	uint_t base_count = 0, after_count = 0;
+	int error;
+
+	aftername = fnvlist_lookup_string(innvl, "after_dataset");
+
+	error = dsl_pool_hold(basename, FTAG, &dp);
+	if (error != 0)
+		return (error);
+
+	error = dsl_dataset_hold(dp, basename, FTAG, &base_ds);
+	if (error != 0) {
+		dsl_pool_rele(dp, FTAG);
+		return (error);
+	}
+
+	error = dsl_dataset_hold(dp, aftername, FTAG, &after_ds);
+	if (error != 0) {
+		dsl_dataset_rele(base_ds, FTAG);
+		dsl_pool_rele(dp, FTAG);
+		return (error);
+	}
+
+	error = dsl_rebase_enum_deltas(dp, base_ds, after_ds, FTAG,
+	    &ancestor, &base_objs, &base_count, &after_objs, &after_count);
+	if (error == 0) {
+		dsl_dataset_name(ancestor, ancestor_name);
+		fnvlist_add_string(outnvl, "ancestor", ancestor_name);
+
+		if (base_count > 0) {
+			fnvlist_add_uint64_array(outnvl, "base_changed_objs",
+			    base_objs, base_count);
+		}
+		if (after_count > 0) {
+			fnvlist_add_uint64_array(outnvl, "after_changed_objs",
+			    after_objs, after_count);
+		}
+
+		dsl_dataset_rele(ancestor, FTAG);
+	}
+
+	if (base_objs != NULL)
+		kmem_free(base_objs, base_count * sizeof (uint64_t));
+	if (after_objs != NULL)
+		kmem_free(after_objs, after_count * sizeof (uint64_t));
+
+	dsl_dataset_rele(after_ds, FTAG);
+	dsl_dataset_rele(base_ds, FTAG);
+	dsl_pool_rele(dp, FTAG);
+	return (error);
+}
+
 static void
 zfs_ioctl_register_dataset_modify(zfs_ioc_t ioc, zfs_ioc_legacy_func_t *func,
     zfs_secpolicy_func_t *secpolicy)
@@ -8209,6 +8284,13 @@ zfs_ioctl_init(void)
 	    POOL_CHECK_SUSPENDED, B_FALSE, B_FALSE,
 	    zfs_keys_rebase_find_ancestor,
 	    ARRAY_SIZE(zfs_keys_rebase_find_ancestor));
+
+	zfs_ioctl_register("rebase_enum_deltas",
+	    ZFS_IOC_REBASE_ENUM_DELTAS,
+	    zfs_ioc_rebase_enum_deltas, zfs_secpolicy_read, DATASET_NAME,
+	    POOL_CHECK_SUSPENDED, B_FALSE, B_FALSE,
+	    zfs_keys_rebase_enum_deltas,
+	    ARRAY_SIZE(zfs_keys_rebase_enum_deltas));
 
 	zfs_ioctl_register("destroy_bookmarks", ZFS_IOC_DESTROY_BOOKMARKS,
 	    zfs_ioc_destroy_bookmarks, zfs_secpolicy_destroy_bookmarks,

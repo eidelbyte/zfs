@@ -33,6 +33,23 @@ extern "C" {
 int dsl_rebase_find_ancestor(dsl_pool_t *dp, dsl_dataset_t *base,
     dsl_dataset_t *after, const void *tag, dsl_dataset_t **ancestor);
 
+/*
+ * Enumerate the dnode objects modified on each branch since the common
+ * ancestor.  Finds the ancestor internally and then traverses each
+ * snapshot's block tree to collect object IDs born after the ancestor's
+ * creation txg.
+ *
+ * On success, *ancestor is held (caller must dsl_dataset_rele),
+ * *base_objsp and *after_objsp are allocated arrays that the caller
+ * must kmem_free (count * sizeof (uint64_t)).  Either array may be
+ * NULL with count 0 if that branch has no changes.
+ */
+int dsl_rebase_enum_deltas(dsl_pool_t *dp, dsl_dataset_t *base,
+    dsl_dataset_t *after, const void *tag,
+    dsl_dataset_t **ancestor,
+    uint64_t **base_objsp, uint_t *base_countp,
+    uint64_t **after_objsp, uint_t *after_countp);
+
 #ifdef	__cplusplus
 }
 #endif
