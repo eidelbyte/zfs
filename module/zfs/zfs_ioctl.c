@@ -168,6 +168,7 @@
 #include <sys/dmu.h>
 #include <sys/dsl_dir.h>
 #include <sys/dsl_dataset.h>
+#include <sys/dsl_rebase.h>
 #include <sys/dsl_prop.h>
 #include <sys/dsl_deleg.h>
 #include <sys/dmu_objset.h>
@@ -8050,6 +8051,62 @@ zfs_ioctl_register_dataset_read(zfs_ioc_t ioc, zfs_ioc_legacy_func_t *func)
 	    zfs_secpolicy_read);
 }
 
+/*
+ * innvl: {
+ *     "after_dataset" -> name of the after (rebased) dataset
+ * }
+ *
+ * outnvl: {
+ *     "ancestor" -> full name of the common ancestor snapshot
+ * }
+ */
+static const zfs_ioc_key_t zfs_keys_rebase_find_ancestor[] = {
+	{"after_dataset",	DATA_TYPE_STRING,	0},
+};
+
+static int
+zfs_ioc_rebase_find_ancestor(const char *basename, nvlist_t *innvl,
+    nvlist_t *outnvl)
+{
+	const char *aftername;
+	dsl_pool_t *dp;
+	dsl_dataset_t *base_ds, *after_ds, *ancestor;
+	char ancestor_name[ZFS_MAX_DATASET_NAME_LEN];
+	int error;
+
+	aftername = fnvlist_lookup_string(innvl, "after_dataset");
+
+	error = dsl_pool_hold(basename, FTAG, &dp);
+	if (error != 0)
+		return (error);
+
+	error = dsl_dataset_hold(dp, basename, FTAG, &base_ds);
+	if (error != 0) {
+		dsl_pool_rele(dp, FTAG);
+		return (error);
+	}
+
+	error = dsl_dataset_hold(dp, aftername, FTAG, &after_ds);
+	if (error != 0) {
+		dsl_dataset_rele(base_ds, FTAG);
+		dsl_pool_rele(dp, FTAG);
+		return (error);
+	}
+
+	error = dsl_rebase_find_ancestor(dp, base_ds, after_ds, FTAG,
+	    &ancestor);
+	if (error == 0) {
+		dsl_dataset_name(ancestor, ancestor_name);
+		fnvlist_add_string(outnvl, "ancestor", ancestor_name);
+		dsl_dataset_rele(ancestor, FTAG);
+	}
+
+	dsl_dataset_rele(after_ds, FTAG);
+	dsl_dataset_rele(base_ds, FTAG);
+	dsl_pool_rele(dp, FTAG);
+	return (error);
+}
+
 static void
 zfs_ioctl_register_dataset_modify(zfs_ioc_t ioc, zfs_ioc_legacy_func_t *func,
     zfs_secpolicy_func_t *secpolicy)
@@ -8145,6 +8202,13 @@ zfs_ioctl_init(void)
 	    POOL_CHECK_SUSPENDED, B_FALSE, B_FALSE,
 	    zfs_keys_objset_get_props,
 	    ARRAY_SIZE(zfs_keys_objset_get_props));
+
+	zfs_ioctl_register("rebase_find_ancestor",
+	    ZFS_IOC_REBASE_FIND_ANCESTOR,
+	    zfs_ioc_rebase_find_ancestor, zfs_secpolicy_read, DATASET_NAME,
+	    POOL_CHECK_SUSPENDED, B_FALSE, B_FALSE,
+	    zfs_keys_rebase_find_ancestor,
+	    ARRAY_SIZE(zfs_keys_rebase_find_ancestor));
 
 	zfs_ioctl_register("destroy_bookmarks", ZFS_IOC_DESTROY_BOOKMARKS,
 	    zfs_ioc_destroy_bookmarks, zfs_secpolicy_destroy_bookmarks,

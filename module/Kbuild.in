@@ -366,6 +366,7 @@ ZFS_OBJS := \
 	dsl_deleg.o \
 	dsl_destroy.o \
 	dsl_dir.o \
+	dsl_rebase.o \
 	dsl_pool.o \
 	dsl_prop.o \
 	dsl_scan.o \

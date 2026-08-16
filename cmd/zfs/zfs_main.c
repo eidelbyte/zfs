@@ -113,6 +113,7 @@ static int zfs_do_change_key(int argc, char **argv);
 static int zfs_do_project(int argc, char **argv);
 static int zfs_do_version(int argc, char **argv);
 static int zfs_do_redact(int argc, char **argv);
+static int zfs_do_rebase(int argc, char **argv);
 static int zfs_do_rewrite(int argc, char **argv);
 static int zfs_do_wait(int argc, char **argv);
 
@@ -185,6 +186,7 @@ typedef enum {
 	HELP_UNLOAD_KEY,
 	HELP_CHANGE_KEY,
 	HELP_VERSION,
+	HELP_REBASE,
 	HELP_REDACT,
 	HELP_REWRITE,
 	HELP_JAIL,
@@ -257,6 +259,7 @@ static zfs_command_t command_table[] = {
 	{ "change-key",	zfs_do_change_key,	HELP_CHANGE_KEY		},
 	{ NULL },
 	{ "program",	zfs_do_channel_program,	HELP_CHANNEL_PROGRAM	},
+	{ "rebase",	zfs_do_rebase,		HELP_REBASE		},
 	{ "rewrite",	zfs_do_rewrite,		HELP_REWRITE		},
 	{ "wait",	zfs_do_wait,		HELP_WAIT		},
 
@@ -429,6 +432,8 @@ get_usage(zfs_help_t idx)
 		    "\tchange-key -i [-l] <filesystem|volume>\n"));
 	case HELP_VERSION:
 		return (gettext("\tversion [-j]\n"));
+	case HELP_REBASE:
+		return (gettext("\trebase -n <base> <after>\n"));
 	case HELP_REDACT:
 		return (gettext("\tredact <snapshot> <bookmark> "
 		    "<redaction_snapshot> ...\n"));
@@ -4220,6 +4225,58 @@ zfs_do_promote(int argc, char **argv)
 
 	zfs_close(zhp);
 	return (ret);
+}
+
+static int
+zfs_do_rebase(int argc, char **argv)
+{
+	int c;
+	boolean_t dry_run = B_FALSE;
+
+	while ((c = getopt(argc, argv, "n")) != -1) {
+		switch (c) {
+		case 'n':
+			dry_run = B_TRUE;
+			break;
+		case '?':
+			(void) fprintf(stderr, gettext("invalid option '%c'\n"),
+			    optopt);
+			usage(B_FALSE);
+		}
+	}
+
+	argc -= optind;
+	argv += optind;
+
+	if (!dry_run) {
+		(void) fprintf(stderr,
+		    gettext("only --dry-run (-n) is supported\n"));
+		return (1);
+	}
+
+	if (argc < 2) {
+		(void) fprintf(stderr,
+		    gettext("missing base and after arguments\n"));
+		usage(B_FALSE);
+	}
+	if (argc > 2) {
+		(void) fprintf(stderr, gettext("too many arguments\n"));
+		usage(B_FALSE);
+	}
+
+	char ancestor[ZFS_MAX_DATASET_NAME_LEN];
+	int error = lzc_rebase_find_ancestor(argv[0], argv[1],
+	    ancestor, sizeof (ancestor));
+
+	if (error != 0) {
+		(void) fprintf(stderr,
+		    gettext("cannot find common ancestor: %s\n"),
+		    strerror(error));
+		return (1);
+	}
+
+	(void) printf("common ancestor: %s\n", ancestor);
+	return (0);
 }
 
 static int

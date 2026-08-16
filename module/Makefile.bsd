@@ -290,6 +290,7 @@ SRCS+=	abd.c \
 	dsl_deleg.c \
 	dsl_destroy.c \
 	dsl_dir.c \
+	dsl_rebase.c \
 	dsl_pool.c \
 	dsl_prop.c \
 	dsl_scan.c \

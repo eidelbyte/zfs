@@ -1615,6 +1615,33 @@ lzc_get_dataset_props(const char *dsname, nvlist_t *props, nvlist_t **outp)
 }
 
 /*
+ * Find the most recent common ancestor snapshot of two datasets.
+ * The ancestor's full name is written into ancestor_buf.
+ */
+int
+lzc_rebase_find_ancestor(const char *base, const char *after,
+    char *ancestor_buf, size_t buflen)
+{
+	nvlist_t *args;
+	nvlist_t *result = NULL;
+	int error;
+
+	args = fnvlist_alloc();
+	fnvlist_add_string(args, "after_dataset", after);
+
+	error = lzc_ioctl(ZFS_IOC_REBASE_FIND_ANCESTOR, base, args, &result);
+	fnvlist_free(args);
+
+	if (error == 0 && result != NULL) {
+		const char *name = fnvlist_lookup_string(result, "ancestor");
+		(void) strlcpy(ancestor_buf, name, buflen);
+	}
+
+	fnvlist_free(result);
+	return (error);
+}
+
+/*
  * Destroys bookmarks.
  *
  * The keys in the bmarks nvlist are the bookmarks to be destroyed.
