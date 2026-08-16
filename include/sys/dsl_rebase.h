@@ -21,6 +21,22 @@ extern "C" {
 #endif
 
 /*
+ * Classified set of dnode-level changes between a snapshot and
+ * the common ancestor.  Each array is sorted by object ID.
+ * Caller frees with rebase_delta_set_free().
+ */
+typedef struct rebase_delta_set {
+	uint64_t	*rds_created;
+	uint_t		rds_ncreated;
+	uint64_t	*rds_deleted;
+	uint_t		rds_ndeleted;
+	uint64_t	*rds_modified;
+	uint_t		rds_nmodified;
+} rebase_delta_set_t;
+
+void rebase_delta_set_free(rebase_delta_set_t *rds);
+
+/*
  * Find the most recent common ancestor snapshot of two datasets.
  *
  * Both datasets must be on the same pool. Walks the snapshot chain
@@ -34,21 +50,20 @@ int dsl_rebase_find_ancestor(dsl_pool_t *dp, dsl_dataset_t *base,
     dsl_dataset_t *after, const void *tag, dsl_dataset_t **ancestor);
 
 /*
- * Enumerate the dnode objects modified on each branch since the common
- * ancestor.  Finds the ancestor internally and then traverses each
- * snapshot's block tree to collect object IDs born after the ancestor's
- * creation txg.
+ * Enumerate dnode-level changes on each branch since the common
+ * ancestor.  Traverses each snapshot's block tree to find dirty dnode
+ * blocks, then compares individual dnode entries against the ancestor
+ * to classify each as created, deleted, or modified.
  *
  * On success, *ancestor is held (caller must dsl_dataset_rele),
- * *base_objsp and *after_objsp are allocated arrays that the caller
- * must kmem_free (count * sizeof (uint64_t)).  Either array may be
- * NULL with count 0 if that branch has no changes.
+ * and base_deltas/after_deltas are populated (caller must free
+ * with rebase_delta_set_free).
  */
 int dsl_rebase_enum_deltas(dsl_pool_t *dp, dsl_dataset_t *base,
     dsl_dataset_t *after, const void *tag,
     dsl_dataset_t **ancestor,
-    uint64_t **base_objsp, uint_t *base_countp,
-    uint64_t **after_objsp, uint_t *after_countp);
+    rebase_delta_set_t *base_deltas,
+    rebase_delta_set_t *after_deltas);
 
 #ifdef	__cplusplus
 }

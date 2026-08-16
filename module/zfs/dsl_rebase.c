@@ -16,6 +16,7 @@
 #include <sys/dmu_traverse.h>
 #include <sys/dmu_objset.h>
 #include <sys/avl.h>
+#include <sys/dnode.h>
 #include <sys/zio.h>
 
 /*
@@ -250,20 +251,156 @@ dsl_rebase_collect_changed_objs(dsl_dataset_t *ds, uint64_t from_txg,
 	return (0);
 }
 
+/*
+ * Shrink a pre-allocated array to its actual used size.  If count is
+ * zero the array is freed and NULL is returned.
+ */
+static uint64_t *
+rebase_shrink_array(uint64_t *arr, uint_t alloc, uint_t count)
+{
+	if (count == 0) {
+		kmem_free(arr, alloc * sizeof (uint64_t));
+		return (NULL);
+	}
+	if (count == alloc)
+		return (arr);
+
+	uint64_t *exact = kmem_alloc(count * sizeof (uint64_t), KM_SLEEP);
+	memcpy(exact, arr, count * sizeof (uint64_t));
+	kmem_free(arr, alloc * sizeof (uint64_t));
+	return (exact);
+}
+
+void
+rebase_delta_set_free(rebase_delta_set_t *rds)
+{
+	if (rds->rds_created != NULL)
+		kmem_free(rds->rds_created,
+		    rds->rds_ncreated * sizeof (uint64_t));
+	if (rds->rds_deleted != NULL)
+		kmem_free(rds->rds_deleted,
+		    rds->rds_ndeleted * sizeof (uint64_t));
+	if (rds->rds_modified != NULL)
+		kmem_free(rds->rds_modified,
+		    rds->rds_nmodified * sizeof (uint64_t));
+	memset(rds, 0, sizeof (*rds));
+}
+
+/*
+ * Classify candidate object IDs as created, deleted, or modified by
+ * comparing individual dnode entries between a snapshot and the
+ * common ancestor.  Candidates from dirty dnode blocks that are
+ * actually unchanged are filtered out.
+ */
+static int
+dsl_rebase_classify_objs(dsl_dataset_t *snap_ds, dsl_dataset_t *anc_ds,
+    uint64_t *candidates, uint_t cand_count,
+    rebase_delta_set_t *result)
+{
+	objset_t *snap_os, *anc_os;
+	int err;
+
+	ASSERT3U(cand_count, >, 0);
+
+	err = dmu_objset_from_ds(snap_ds, &snap_os);
+	if (err != 0)
+		return (err);
+
+	err = dmu_objset_from_ds(anc_ds, &anc_os);
+	if (err != 0)
+		return (err);
+
+	uint64_t *created = kmem_alloc(cand_count * sizeof (uint64_t),
+	    KM_SLEEP);
+	uint64_t *deleted = kmem_alloc(cand_count * sizeof (uint64_t),
+	    KM_SLEEP);
+	uint64_t *modified = kmem_alloc(cand_count * sizeof (uint64_t),
+	    KM_SLEEP);
+	uint_t ncreated = 0, ndeleted = 0, nmodified = 0;
+
+	for (uint_t i = 0; i < cand_count; i++) {
+		dnode_t *dn_snap = NULL, *dn_anc = NULL;
+		int err_snap, err_anc;
+		boolean_t snap_exists, anc_exists;
+
+		err_snap = dnode_hold(snap_os, candidates[i], FTAG,
+		    &dn_snap);
+		err_anc = dnode_hold(anc_os, candidates[i], FTAG,
+		    &dn_anc);
+
+		if (err_snap != 0 && err_snap != ENOENT) {
+			if (err_anc == 0)
+				dnode_rele(dn_anc, FTAG);
+			err = err_snap;
+			goto out;
+		}
+		if (err_anc != 0 && err_anc != ENOENT) {
+			if (err_snap == 0)
+				dnode_rele(dn_snap, FTAG);
+			err = err_anc;
+			goto out;
+		}
+
+		snap_exists = (err_snap == 0);
+		anc_exists = (err_anc == 0);
+
+		if (snap_exists && !anc_exists) {
+			created[ncreated++] = candidates[i];
+		} else if (!snap_exists && anc_exists) {
+			deleted[ndeleted++] = candidates[i];
+		} else if (snap_exists && anc_exists) {
+			uint8_t extra_snap =
+			    dn_snap->dn_phys->dn_extra_slots;
+			uint8_t extra_anc =
+			    dn_anc->dn_phys->dn_extra_slots;
+			size_t phys_size =
+			    (1 + extra_snap) * DNODE_MIN_SIZE;
+
+			if (extra_snap != extra_anc ||
+			    memcmp(dn_snap->dn_phys, dn_anc->dn_phys,
+			    phys_size) != 0) {
+				modified[nmodified++] = candidates[i];
+			}
+		}
+
+		if (snap_exists)
+			dnode_rele(dn_snap, FTAG);
+		if (anc_exists)
+			dnode_rele(dn_anc, FTAG);
+	}
+
+	result->rds_created = rebase_shrink_array(created, cand_count,
+	    ncreated);
+	result->rds_ncreated = ncreated;
+	result->rds_deleted = rebase_shrink_array(deleted, cand_count,
+	    ndeleted);
+	result->rds_ndeleted = ndeleted;
+	result->rds_modified = rebase_shrink_array(modified, cand_count,
+	    nmodified);
+	result->rds_nmodified = nmodified;
+	return (0);
+
+out:
+	kmem_free(created, cand_count * sizeof (uint64_t));
+	kmem_free(deleted, cand_count * sizeof (uint64_t));
+	kmem_free(modified, cand_count * sizeof (uint64_t));
+	return (err);
+}
+
 int
 dsl_rebase_enum_deltas(dsl_pool_t *dp, dsl_dataset_t *base,
     dsl_dataset_t *after, const void *tag,
     dsl_dataset_t **ancestor,
-    uint64_t **base_objsp, uint_t *base_countp,
-    uint64_t **after_objsp, uint_t *after_countp)
+    rebase_delta_set_t *base_deltas,
+    rebase_delta_set_t *after_deltas)
 {
 	uint64_t from_txg;
+	uint64_t *candidates = NULL;
+	uint_t cand_count = 0;
 	int err;
 
-	*base_objsp = NULL;
-	*base_countp = 0;
-	*after_objsp = NULL;
-	*after_countp = 0;
+	memset(base_deltas, 0, sizeof (*base_deltas));
+	memset(after_deltas, 0, sizeof (*after_deltas));
 
 	err = dsl_rebase_find_ancestor(dp, base, after, tag, ancestor);
 	if (err != 0)
@@ -275,26 +412,43 @@ dsl_rebase_enum_deltas(dsl_pool_t *dp, dsl_dataset_t *base,
 	 */
 	from_txg = dsl_dataset_phys(*ancestor)->ds_creation_txg + 1;
 
-	err = dsl_rebase_collect_changed_objs(base, from_txg, base_objsp,
-	    base_countp);
-	if (err != 0) {
-		dsl_dataset_rele(*ancestor, tag);
-		*ancestor = NULL;
-		return (err);
+	err = dsl_rebase_collect_changed_objs(base, from_txg,
+	    &candidates, &cand_count);
+	if (err != 0)
+		goto fail;
+
+	if (cand_count > 0) {
+		err = dsl_rebase_classify_objs(base, *ancestor,
+		    candidates, cand_count, base_deltas);
+		kmem_free(candidates, cand_count * sizeof (uint64_t));
+		candidates = NULL;
+		cand_count = 0;
+		if (err != 0)
+			goto fail;
 	}
 
-	err = dsl_rebase_collect_changed_objs(after, from_txg, after_objsp,
-	    after_countp);
-	if (err != 0) {
-		if (*base_objsp != NULL)
-			kmem_free(*base_objsp,
-			    *base_countp * sizeof (uint64_t));
-		*base_objsp = NULL;
-		*base_countp = 0;
-		dsl_dataset_rele(*ancestor, tag);
-		*ancestor = NULL;
-		return (err);
+	err = dsl_rebase_collect_changed_objs(after, from_txg,
+	    &candidates, &cand_count);
+	if (err != 0)
+		goto fail;
+
+	if (cand_count > 0) {
+		err = dsl_rebase_classify_objs(after, *ancestor,
+		    candidates, cand_count, after_deltas);
+		kmem_free(candidates, cand_count * sizeof (uint64_t));
+		candidates = NULL;
+		if (err != 0)
+			goto fail;
 	}
 
 	return (0);
+
+fail:
+	if (candidates != NULL)
+		kmem_free(candidates, cand_count * sizeof (uint64_t));
+	rebase_delta_set_free(base_deltas);
+	rebase_delta_set_free(after_deltas);
+	dsl_dataset_rele(*ancestor, tag);
+	*ancestor = NULL;
+	return (err);
 }

@@ -4275,37 +4275,75 @@ zfs_do_rebase(int argc, char **argv)
 	}
 
 	const char *ancestor = fnvlist_lookup_string(result, "ancestor");
-	(void) printf("common ancestor: %s\n", ancestor);
+	(void) printf("common ancestor: %s\n\n", ancestor);
 
-	uint64_t *base_objs = NULL, *after_objs = NULL;
-	uint_t base_count = 0, after_count = 0;
+	uint64_t *bc = NULL, *bd = NULL, *bm = NULL;
+	uint64_t *ac = NULL, *ad = NULL, *am = NULL;
+	uint_t nbc = 0, nbd = 0, nbm = 0;
+	uint_t nac = 0, nad = 0, nam = 0;
 
-	(void) nvlist_lookup_uint64_array(result, "base_changed_objs",
-	    &base_objs, &base_count);
-	(void) nvlist_lookup_uint64_array(result, "after_changed_objs",
-	    &after_objs, &after_count);
+	(void) nvlist_lookup_uint64_array(result, "base_created", &bc, &nbc);
+	(void) nvlist_lookup_uint64_array(result, "base_deleted", &bd, &nbd);
+	(void) nvlist_lookup_uint64_array(result, "base_modified", &bm, &nbm);
+	(void) nvlist_lookup_uint64_array(result, "after_created", &ac, &nac);
+	(void) nvlist_lookup_uint64_array(result, "after_deleted", &ad, &nad);
+	(void) nvlist_lookup_uint64_array(result, "after_modified", &am, &nam);
 
-	(void) printf("base  (%s → %s): %u object(s) modified\n",
-	    ancestor, argv[0], base_count);
-	for (uint_t i = 0; i < base_count; i++)
-		(void) printf("  object %llu\n", (u_longlong_t)base_objs[i]);
+	(void) printf("base  (%s -> %s): %u changed"
+	    " (%u created, %u deleted, %u modified)\n",
+	    ancestor, argv[0], nbc + nbd + nbm, nbc, nbd, nbm);
+	if (nbc > 0) {
+		(void) printf("  created:");
+		for (uint_t i = 0; i < nbc; i++)
+			(void) printf(" %llu", (u_longlong_t)bc[i]);
+		(void) printf("\n");
+	}
+	if (nbd > 0) {
+		(void) printf("  deleted:");
+		for (uint_t i = 0; i < nbd; i++)
+			(void) printf(" %llu", (u_longlong_t)bd[i]);
+		(void) printf("\n");
+	}
+	if (nbm > 0) {
+		(void) printf("  modified:");
+		for (uint_t i = 0; i < nbm; i++)
+			(void) printf(" %llu", (u_longlong_t)bm[i]);
+		(void) printf("\n");
+	}
 
-	(void) printf("after (%s → %s): %u object(s) modified\n",
-	    ancestor, argv[1], after_count);
-	for (uint_t i = 0; i < after_count; i++)
-		(void) printf("  object %llu\n", (u_longlong_t)after_objs[i]);
+	(void) printf("after (%s -> %s): %u changed"
+	    " (%u created, %u deleted, %u modified)\n",
+	    ancestor, argv[1], nac + nad + nam, nac, nad, nam);
+	if (nac > 0) {
+		(void) printf("  created:");
+		for (uint_t i = 0; i < nac; i++)
+			(void) printf(" %llu", (u_longlong_t)ac[i]);
+		(void) printf("\n");
+	}
+	if (nad > 0) {
+		(void) printf("  deleted:");
+		for (uint_t i = 0; i < nad; i++)
+			(void) printf(" %llu", (u_longlong_t)ad[i]);
+		(void) printf("\n");
+	}
+	if (nam > 0) {
+		(void) printf("  modified:");
+		for (uint_t i = 0; i < nam; i++)
+			(void) printf(" %llu", (u_longlong_t)am[i]);
+		(void) printf("\n");
+	}
 
-	/* Compute intersection — potential conflicts */
-	uint_t conflicts = 0;
-	for (uint_t i = 0; i < base_count; i++) {
-		for (uint_t j = 0; j < after_count; j++) {
-			if (base_objs[i] == after_objs[j]) {
-				conflicts++;
+	/* Objects modified on both sides need diff3 resolution */
+	uint_t both_modified = 0;
+	for (uint_t i = 0; i < nbm; i++) {
+		for (uint_t j = 0; j < nam; j++) {
+			if (bm[i] == am[j]) {
+				both_modified++;
 				break;
 			}
 		}
 	}
-	(void) printf("potential conflicts: %u object(s)\n", conflicts);
+	(void) printf("\nboth sides modified: %u object(s)\n", both_modified);
 
 	fnvlist_free(result);
 	return (0);

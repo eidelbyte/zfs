@@ -8130,8 +8130,7 @@ zfs_ioc_rebase_enum_deltas(const char *basename, nvlist_t *innvl,
 	dsl_pool_t *dp;
 	dsl_dataset_t *base_ds, *after_ds, *ancestor;
 	char ancestor_name[ZFS_MAX_DATASET_NAME_LEN];
-	uint64_t *base_objs = NULL, *after_objs = NULL;
-	uint_t base_count = 0, after_count = 0;
+	rebase_delta_set_t base_deltas, after_deltas;
 	int error;
 
 	aftername = fnvlist_lookup_string(innvl, "after_dataset");
@@ -8153,28 +8152,46 @@ zfs_ioc_rebase_enum_deltas(const char *basename, nvlist_t *innvl,
 		return (error);
 	}
 
+	memset(&base_deltas, 0, sizeof (base_deltas));
+	memset(&after_deltas, 0, sizeof (after_deltas));
+
 	error = dsl_rebase_enum_deltas(dp, base_ds, after_ds, FTAG,
-	    &ancestor, &base_objs, &base_count, &after_objs, &after_count);
+	    &ancestor, &base_deltas, &after_deltas);
 	if (error == 0) {
 		dsl_dataset_name(ancestor, ancestor_name);
 		fnvlist_add_string(outnvl, "ancestor", ancestor_name);
 
-		if (base_count > 0) {
-			fnvlist_add_uint64_array(outnvl, "base_changed_objs",
-			    base_objs, base_count);
-		}
-		if (after_count > 0) {
-			fnvlist_add_uint64_array(outnvl, "after_changed_objs",
-			    after_objs, after_count);
-		}
+		if (base_deltas.rds_ncreated > 0)
+			fnvlist_add_uint64_array(outnvl, "base_created",
+			    base_deltas.rds_created,
+			    base_deltas.rds_ncreated);
+		if (base_deltas.rds_ndeleted > 0)
+			fnvlist_add_uint64_array(outnvl, "base_deleted",
+			    base_deltas.rds_deleted,
+			    base_deltas.rds_ndeleted);
+		if (base_deltas.rds_nmodified > 0)
+			fnvlist_add_uint64_array(outnvl, "base_modified",
+			    base_deltas.rds_modified,
+			    base_deltas.rds_nmodified);
+
+		if (after_deltas.rds_ncreated > 0)
+			fnvlist_add_uint64_array(outnvl, "after_created",
+			    after_deltas.rds_created,
+			    after_deltas.rds_ncreated);
+		if (after_deltas.rds_ndeleted > 0)
+			fnvlist_add_uint64_array(outnvl, "after_deleted",
+			    after_deltas.rds_deleted,
+			    after_deltas.rds_ndeleted);
+		if (after_deltas.rds_nmodified > 0)
+			fnvlist_add_uint64_array(outnvl, "after_modified",
+			    after_deltas.rds_modified,
+			    after_deltas.rds_nmodified);
 
 		dsl_dataset_rele(ancestor, FTAG);
 	}
 
-	if (base_objs != NULL)
-		kmem_free(base_objs, base_count * sizeof (uint64_t));
-	if (after_objs != NULL)
-		kmem_free(after_objs, after_count * sizeof (uint64_t));
+	rebase_delta_set_free(&base_deltas);
+	rebase_delta_set_free(&after_deltas);
 
 	dsl_dataset_rele(after_ds, FTAG);
 	dsl_dataset_rele(base_ds, FTAG);
