@@ -195,6 +195,7 @@
 #include <sys/dmu_recv.h>
 #include <sys/dsl_destroy.h>
 #include <sys/dsl_bookmark.h>
+#include <sys/dsl_rebase.h>
 #include <sys/dsl_userhold.h>
 #include <sys/zfeature.h>
 #include <sys/zio_checksum.h>
@@ -8058,6 +8059,34 @@ zfs_ioctl_register_dataset_modify(zfs_ioc_t ioc, zfs_ioc_legacy_func_t *func,
 	    DATASET_NAME, B_TRUE, POOL_CHECK_SUSPENDED | POOL_CHECK_READONLY);
 }
 
+/*
+ * innvl: {
+ *     "right_ds" -> name of right/source dataset or snapshot
+ * }
+ *
+ * The left dataset is the one named by fsname (the ioctl target).
+ * The common ancestor (base) is auto-discovered by walking both
+ * snapshot chains.
+ *
+ * outnvl: {
+ *     "conflicts" -> uint64 count of conflicts (0 = clean rebase)
+ * }
+ */
+static const zfs_ioc_key_t zfs_keys_rebase[] = {
+	{"right_ds",	DATA_TYPE_STRING,	0},
+};
+
+static int
+zfs_ioc_rebase(const char *fsname, nvlist_t *innvl, nvlist_t *outnvl)
+{
+	const char *right_ds;
+
+	if (nvlist_lookup_string(innvl, "right_ds", &right_ds) != 0)
+		return (SET_ERROR(EINVAL));
+
+	return (dsl_rebase(fsname, right_ds, outnvl));
+}
+
 static void
 zfs_ioctl_init(void)
 {
@@ -8268,6 +8297,11 @@ zfs_ioctl_init(void)
 	    zfs_ioc_ddt_prune, zfs_secpolicy_config, POOL_NAME,
 	    POOL_CHECK_SUSPENDED | POOL_CHECK_READONLY, B_TRUE, B_TRUE,
 	    zfs_keys_ddt_prune, ARRAY_SIZE(zfs_keys_ddt_prune));
+
+	zfs_ioctl_register("rebase", ZFS_IOC_REBASE,
+	    zfs_ioc_rebase, zfs_secpolicy_config, DATASET_NAME,
+	    POOL_CHECK_SUSPENDED | POOL_CHECK_READONLY, B_FALSE, B_TRUE,
+	    zfs_keys_rebase, ARRAY_SIZE(zfs_keys_rebase));
 
 	/* IOCTLS that use the legacy function signature */
 
