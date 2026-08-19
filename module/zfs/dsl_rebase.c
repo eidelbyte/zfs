@@ -182,8 +182,12 @@ rebase_change_obj_cmp(const void *a, const void *b)
 {
 	const rebase_change_t *la = a;
 	const rebase_change_t *lb = b;
+	int cmp;
 
-	return (TREE_CMP(la->rc_obj, lb->rc_obj));
+	cmp = TREE_CMP(la->rc_obj, lb->rc_obj);
+	if (cmp != 0)
+		return (cmp);
+	return (strcmp(la->rc_path, lb->rc_path));
 }
 
 static void
@@ -293,6 +297,365 @@ rebase_check_preconditions(dsl_pool_t *dp, dsl_dataset_t *left,
 	return (0);
 }
 
+/*
+ * Build a child path by appending "/name" to parent.
+ * Returns a kmem_alloc'd string; *lenp receives the allocation
+ * size (including the NUL terminator).
+ */
+static char *
+rebase_build_path(const char *parent, size_t parentlen,
+    const char *name, size_t *lenp)
+{
+	size_t plen = parentlen - 1;
+	size_t nlen = strlen(name);
+	size_t alloc;
+	char *path;
+
+	if (plen == 1 && parent[0] == '/') {
+		alloc = 1 + nlen + 1;
+		path = kmem_alloc(alloc, KM_SLEEP);
+		path[0] = '/';
+		memcpy(path + 1, name, nlen + 1);
+	} else {
+		alloc = plen + 1 + nlen + 1;
+		path = kmem_alloc(alloc, KM_SLEEP);
+		memcpy(path, parent, plen);
+		path[plen] = '/';
+		memcpy(path + plen + 1, name, nlen + 1);
+	}
+
+	*lenp = alloc;
+	return (path);
+}
+
+/*
+ * Compare bonus buffers for the same object across two objsets.
+ * Sets *samep to B_TRUE when the buffers are byte-identical.
+ */
+static int
+rebase_bonus_equal(objset_t *os_a, objset_t *os_b,
+    uint64_t obj, boolean_t *samep)
+{
+	dmu_buf_t *db_a, *db_b;
+	int err;
+
+	err = dmu_bonus_hold(os_a, obj, FTAG, &db_a);
+	if (err != 0)
+		return (err);
+
+	err = dmu_bonus_hold(os_b, obj, FTAG, &db_b);
+	if (err != 0) {
+		dmu_buf_rele(db_a, FTAG);
+		return (err);
+	}
+
+	*samep = (db_a->db_size == db_b->db_size &&
+	    memcmp(db_a->db_data, db_b->db_data,
+	    db_a->db_size) == 0);
+
+	dmu_buf_rele(db_b, FTAG);
+	dmu_buf_rele(db_a, FTAG);
+	return (0);
+}
+
+/*
+ * Allocate a change record and insert it into both AVL trees.
+ * The path string is copied; the caller retains ownership.
+ */
+static void
+rebase_record_change(rebase_changelist_t *rcl,
+    rebase_change_type_t type, uint64_t obj,
+    const char *path, size_t pathlen, uint8_t dn_type)
+{
+	rebase_change_t *rc;
+
+	rc = kmem_zalloc(sizeof (*rc), KM_SLEEP);
+	rc->rc_type = type;
+	rc->rc_obj = obj;
+	rc->rc_pathlen = pathlen;
+	rc->rc_path = kmem_alloc(pathlen, KM_SLEEP);
+	memcpy(rc->rc_path, path, pathlen);
+	rc->rc_dn_type = dn_type;
+
+	avl_add(&rcl->rcl_by_path, rc);
+	avl_add(&rcl->rcl_by_obj, rc);
+	rcl->rcl_count++;
+}
+
+/*
+ * Recursively record every entry in a single-side directory tree
+ * as type (RCT_ADD or RCT_DELETE).  Used when an entire directory
+ * exists on only one side of the diff.
+ */
+static int
+rebase_walk_tree(objset_t *os, rebase_changelist_t *rcl,
+    rebase_change_type_t type, uint64_t dir_obj,
+    const char *path, size_t pathlen, zap_attribute_t *za)
+{
+	zap_cursor_t zc;
+	int err = 0;
+
+	for (zap_cursor_init(&zc, os, dir_obj);
+	    (err = zap_cursor_retrieve(&zc, za)) == 0;
+	    zap_cursor_advance(&zc)) {
+		uint64_t child_obj = ZFS_DIRENT_OBJ(za->za_first_integer);
+		dmu_object_info_t doi;
+		char *cpath;
+		size_t cpathlen;
+
+		cpath = rebase_build_path(path, pathlen,
+		    za->za_name, &cpathlen);
+
+		err = dmu_object_info(os, child_obj, &doi);
+		if (err != 0) {
+			kmem_free(cpath, cpathlen);
+			break;
+		}
+
+		rebase_record_change(rcl, type, child_obj,
+		    cpath, cpathlen, doi.doi_type);
+
+		if (doi.doi_type == DMU_OT_DIRECTORY_CONTENTS) {
+			err = rebase_walk_tree(os, rcl, type,
+			    child_obj, cpath, cpathlen, za);
+			if (err != 0) {
+				kmem_free(cpath, cpathlen);
+				break;
+			}
+		}
+
+		kmem_free(cpath, cpathlen);
+	}
+
+	if (err == ENOENT)
+		err = 0;
+
+	zap_cursor_fini(&zc);
+	return (err);
+}
+
+/*
+ * Compare two directory ZAPs entry-by-entry, recording differences
+ * in the changelist.
+ *
+ * Phase 1: iterate base entries.
+ *   - Same name, same obj, directory  → always recurse (a directory's
+ *     own metadata does not reflect changes to child dnodes).
+ *   - Same name, same obj, file  → bonus buffer check: if bonus
+ *     differs the SA attributes changed, record EDIT.
+ *   - Same name, diff obj  → EDIT; recurse into directories.
+ *   - Name only in base    → DELETE; recurse deleted directories.
+ *
+ * Phase 2: iterate side entries.
+ *   - Name not in base     → ADD; recurse added directories.
+ */
+static int
+rebase_diff_dir(objset_t *base_os, objset_t *side_os,
+    uint64_t base_dir, uint64_t side_dir,
+    const char *path, size_t pathlen,
+    rebase_changelist_t *rcl, zap_attribute_t *za)
+{
+	zap_cursor_t zc;
+	int err = 0;
+
+	/* Phase 1: iterate base, find DELETEs and EDITs. */
+	for (zap_cursor_init(&zc, base_os, base_dir);
+	    (err = zap_cursor_retrieve(&zc, za)) == 0;
+	    zap_cursor_advance(&zc)) {
+		uint64_t base_child = ZFS_DIRENT_OBJ(za->za_first_integer);
+		uint64_t side_child;
+		dmu_object_info_t doi;
+		char *cpath;
+		size_t cpathlen;
+
+		cpath = rebase_build_path(path, pathlen,
+		    za->za_name, &cpathlen);
+
+		err = zap_lookup(side_os, side_dir, za->za_name,
+		    8, 1, &side_child);
+
+		if (err == ENOENT) {
+			/* Base only → DELETE. */
+			err = dmu_object_info(base_os, base_child,
+			    &doi);
+			if (err != 0) {
+				kmem_free(cpath, cpathlen);
+				break;
+			}
+
+			rebase_record_change(rcl, RCT_DELETE,
+			    base_child, cpath, cpathlen,
+			    doi.doi_type);
+
+			if (doi.doi_type ==
+			    DMU_OT_DIRECTORY_CONTENTS) {
+				err = rebase_walk_tree(base_os, rcl,
+				    RCT_DELETE, base_child,
+				    cpath, cpathlen, za);
+			}
+
+			kmem_free(cpath, cpathlen);
+			if (err != 0)
+				break;
+			continue;
+		}
+		if (err != 0) {
+			kmem_free(cpath, cpathlen);
+			break;
+		}
+
+		side_child = ZFS_DIRENT_OBJ(side_child);
+
+		if (base_child == side_child) {
+			err = dmu_object_info(base_os,
+			    base_child, &doi);
+			if (err != 0) {
+				kmem_free(cpath, cpathlen);
+				break;
+			}
+
+			if (doi.doi_type ==
+			    DMU_OT_DIRECTORY_CONTENTS) {
+				/*
+				 * Always recurse into subdirectories.
+				 * A directory's bonus buffer does not
+				 * reflect changes to child dnodes, so
+				 * we cannot skip the walk.
+				 */
+				err = rebase_diff_dir(base_os,
+				    side_os, base_child,
+				    side_child, cpath,
+				    cpathlen, rcl, za);
+			} else {
+				boolean_t same;
+
+				err = rebase_bonus_equal(base_os,
+				    side_os, base_child, &same);
+				if (err != 0) {
+					kmem_free(cpath, cpathlen);
+					break;
+				}
+
+				if (!same) {
+					rebase_record_change(rcl,
+					    RCT_EDIT, side_child,
+					    cpath, cpathlen,
+					    doi.doi_type);
+				}
+			}
+
+			kmem_free(cpath, cpathlen);
+			if (err != 0)
+				break;
+			continue;
+		}
+
+		/* Different object at same path → EDIT. */
+		err = dmu_object_info(side_os, side_child, &doi);
+		if (err != 0) {
+			kmem_free(cpath, cpathlen);
+			break;
+		}
+
+		rebase_record_change(rcl, RCT_EDIT, side_child,
+		    cpath, cpathlen, doi.doi_type);
+
+		if (doi.doi_type == DMU_OT_DIRECTORY_CONTENTS) {
+			err = rebase_diff_dir(base_os, side_os,
+			    base_child, side_child,
+			    cpath, cpathlen, rcl, za);
+		}
+
+		kmem_free(cpath, cpathlen);
+		if (err != 0)
+			break;
+	}
+
+	if (err == ENOENT)
+		err = 0;
+
+	zap_cursor_fini(&zc);
+
+	if (err != 0)
+		return (err);
+
+	/* Phase 2: iterate side, find ADDs. */
+	for (zap_cursor_init(&zc, side_os, side_dir);
+	    (err = zap_cursor_retrieve(&zc, za)) == 0;
+	    zap_cursor_advance(&zc)) {
+		uint64_t side_child = ZFS_DIRENT_OBJ(za->za_first_integer);
+		uint64_t dummy;
+		dmu_object_info_t doi;
+		char *cpath;
+		size_t cpathlen;
+
+		err = zap_lookup(base_os, base_dir, za->za_name,
+		    8, 1, &dummy);
+
+		if (err == ENOENT) {
+			/* Side only → ADD. */
+			cpath = rebase_build_path(path, pathlen,
+			    za->za_name, &cpathlen);
+
+			err = dmu_object_info(side_os, side_child,
+			    &doi);
+			if (err != 0) {
+				kmem_free(cpath, cpathlen);
+				break;
+			}
+
+			rebase_record_change(rcl, RCT_ADD,
+			    side_child, cpath, cpathlen,
+			    doi.doi_type);
+
+			if (doi.doi_type ==
+			    DMU_OT_DIRECTORY_CONTENTS) {
+				err = rebase_walk_tree(side_os, rcl,
+				    RCT_ADD, side_child,
+				    cpath, cpathlen, za);
+			}
+
+			kmem_free(cpath, cpathlen);
+			if (err != 0)
+				break;
+			continue;
+		}
+		if (err != 0)
+			break;
+	}
+
+	if (err == ENOENT)
+		err = 0;
+
+	zap_cursor_fini(&zc);
+	return (err);
+}
+
+/*
+ * Populate both changelists by diffing base against each side.
+ */
+static int
+rebase_diff(rebase_state_t *rs)
+{
+	zap_attribute_t *za;
+	int err;
+
+	za = zap_attribute_alloc();
+
+	err = rebase_diff_dir(rs->rs_base_os, rs->rs_left_os,
+	    rs->rs_base_root, rs->rs_left_root,
+	    "/", 2, &rs->rs_left_changes, za);
+
+	if (err == 0) {
+		err = rebase_diff_dir(rs->rs_base_os, rs->rs_right_os,
+		    rs->rs_base_root, rs->rs_right_root,
+		    "/", 2, &rs->rs_right_changes, za);
+	}
+
+	zap_attribute_free(za);
+	return (err);
+}
+
 int
 dsl_rebase(const char *left_ds, const char *right_ds, nvlist_t *outnvl)
 {
@@ -393,11 +756,16 @@ dsl_rebase(const char *left_ds, const char *right_ds, nvlist_t *outnvl)
 	rebase_changelist_init(&state.rs_left_changes);
 	rebase_changelist_init(&state.rs_right_changes);
 
-	/*
-	 * State initialized.  Subsequent issues will fill in
-	 * diff, apply, and emit phases here.
-	 */
-	err = SET_ERROR(ENOSYS);
+	/* Diff phase: populate changelists. */
+	err = rebase_diff(&state);
+	if (err == 0) {
+		/*
+		 * Changelists populated.  Subsequent issues will
+		 * fill in collapse, cross-reference, apply, and
+		 * emit phases here.
+		 */
+		err = SET_ERROR(ENOSYS);
+	}
 
 	rebase_changelist_fini(&state.rs_left_changes);
 	rebase_changelist_fini(&state.rs_right_changes);
