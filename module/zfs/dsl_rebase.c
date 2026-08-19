@@ -166,6 +166,58 @@ rebase_find_common(dsl_pool_t *dp, dsl_dataset_t *left,
 }
 
 /*
+ * AVL comparators for rebase_change_t.
+ */
+static int
+rebase_change_path_cmp(const void *a, const void *b)
+{
+	const rebase_change_t *la = a;
+	const rebase_change_t *lb = b;
+
+	return (strcmp(la->rc_path, lb->rc_path));
+}
+
+static int
+rebase_change_obj_cmp(const void *a, const void *b)
+{
+	const rebase_change_t *la = a;
+	const rebase_change_t *lb = b;
+
+	return (TREE_CMP(la->rc_obj, lb->rc_obj));
+}
+
+static void
+rebase_changelist_init(rebase_changelist_t *rcl)
+{
+	avl_create(&rcl->rcl_by_path, rebase_change_path_cmp,
+	    sizeof (rebase_change_t),
+	    offsetof(rebase_change_t, rc_avl_path));
+	avl_create(&rcl->rcl_by_obj, rebase_change_obj_cmp,
+	    sizeof (rebase_change_t),
+	    offsetof(rebase_change_t, rc_avl_obj));
+	rcl->rcl_count = 0;
+}
+
+static void
+rebase_changelist_fini(rebase_changelist_t *rcl)
+{
+	rebase_change_t *rc;
+	void *cookie = NULL;
+
+	while ((rc = avl_destroy_nodes(&rcl->rcl_by_path,
+	    &cookie)) != NULL) {
+		avl_remove(&rcl->rcl_by_obj, rc);
+		if (rc->rc_path != NULL)
+			kmem_free(rc->rc_path, rc->rc_pathlen);
+		if (rc->rc_old_path != NULL)
+			kmem_free(rc->rc_old_path, rc->rc_old_pathlen);
+		kmem_free(rc, sizeof (*rc));
+	}
+	avl_destroy(&rcl->rcl_by_path);
+	avl_destroy(&rcl->rcl_by_obj);
+}
+
+/*
  * Read a uint64 from a dataset's MASTER_NODE ZAP.
  */
 static int
@@ -247,6 +299,7 @@ dsl_rebase(const char *left_ds, const char *right_ds, nvlist_t *outnvl)
 	dsl_pool_t *dp;
 	dsl_dataset_t *left, *right, *base;
 	objset_t *left_os, *right_os, *base_os;
+	rebase_state_t state;
 	int err;
 
 	(void) outnvl;
@@ -312,11 +365,42 @@ dsl_rebase(const char *left_ds, const char *right_ds, nvlist_t *outnvl)
 	if (err != 0)
 		goto rele_base;
 
+	/* Populate rebase state. */
+	state.rs_left = left;
+	state.rs_right = right;
+	state.rs_base = base;
+	state.rs_left_os = left_os;
+	state.rs_right_os = right_os;
+	state.rs_base_os = base_os;
+
+	/* Look up root directory object numbers. */
+	err = rebase_master_lookup(left_os, ZFS_ROOT_OBJ,
+	    &state.rs_left_root);
+	if (err != 0)
+		goto rele_base;
+
+	err = rebase_master_lookup(right_os, ZFS_ROOT_OBJ,
+	    &state.rs_right_root);
+	if (err != 0)
+		goto rele_base;
+
+	err = rebase_master_lookup(base_os, ZFS_ROOT_OBJ,
+	    &state.rs_base_root);
+	if (err != 0)
+		goto rele_base;
+
+	/* Initialize changelists. */
+	rebase_changelist_init(&state.rs_left_changes);
+	rebase_changelist_init(&state.rs_right_changes);
+
 	/*
-	 * Preconditions passed.  Subsequent issues will fill in
-	 * dataset-setup, diff, apply, and emit phases here.
+	 * State initialized.  Subsequent issues will fill in
+	 * diff, apply, and emit phases here.
 	 */
 	err = SET_ERROR(ENOSYS);
+
+	rebase_changelist_fini(&state.rs_left_changes);
+	rebase_changelist_fini(&state.rs_right_changes);
 
 rele_base:
 	dsl_dataset_rele(base, FTAG);
