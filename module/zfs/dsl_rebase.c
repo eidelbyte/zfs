@@ -1118,6 +1118,183 @@ rebase_diff(rebase_state_t *rs)
 	return (err);
 }
 
+/*
+ * Check whether the same dnode slot in two objsets holds the
+ * same dnode, not a freed-and-reallocated slot.  Compares
+ * ZPL_GEN — matching generation means the dnode was neither
+ * freed nor reallocated.  Returns B_FALSE in *samep if the
+ * object does not exist in either objset, has type NONE
+ * (freed slot), or ZPL_GEN differs.
+ */
+static int
+rebase_same_gen(objset_t *os_a, objset_t *os_b,
+    uint64_t obj, boolean_t *samep)
+{
+	dmu_object_info_t doi;
+	sa_handle_t *hdl_a = NULL, *hdl_b = NULL;
+	uint64_t gen_a, gen_b;
+	int err;
+
+	*samep = B_FALSE;
+
+	err = dmu_object_info(os_a, obj, &doi);
+	if (err != 0 || doi.doi_type == DMU_OT_NONE)
+		return (0);
+
+	err = dmu_object_info(os_b, obj, &doi);
+	if (err != 0 || doi.doi_type == DMU_OT_NONE)
+		return (0);
+
+	err = sa_handle_get(os_a, obj, NULL, SA_HDL_PRIVATE, &hdl_a);
+	if (err != 0)
+		return (err);
+
+	err = sa_handle_get(os_b, obj, NULL, SA_HDL_PRIVATE, &hdl_b);
+	if (err != 0) {
+		sa_handle_destroy(hdl_a);
+		return (err);
+	}
+
+	err = sa_lookup(hdl_a, ZPL_GEN, &gen_a, sizeof (gen_a));
+	if (err != 0)
+		goto out;
+
+	err = sa_lookup(hdl_b, ZPL_GEN, &gen_b, sizeof (gen_b));
+	if (err != 0)
+		goto out;
+
+	*samep = (gen_a == gen_b);
+
+out:
+	sa_handle_destroy(hdl_b);
+	sa_handle_destroy(hdl_a);
+	return (err);
+}
+
+/*
+ * Collapse phase — second pass over a single changelist.
+ *
+ * Walk the rcl_by_obj index where entries with the same dnode
+ * object number are adjacent (obj comparator, path tiebreaker).
+ *
+ * Pass 1 — move detection:
+ *   An ADD+DELETE pair for the same obj# with matching ZPL_GEN
+ *   is a rename/move.  Collapse to RCT_MOVE (content unchanged)
+ *   or RCT_MOVE_EDIT (content differs from base).  The DELETE
+ *   entry is removed from both AVL trees and freed; the ADD
+ *   entry is promoted in-place with rc_old_path set to the
+ *   DELETE's path.
+ *
+ * Pass 2 — hardlink detection:
+ *   A remaining ADD whose obj# exists in base with matching
+ *   ZPL_GEN is RCT_HARDLINK_ADD (new link to existing dnode).
+ *   A remaining DELETE whose obj# still exists in the side
+ *   with matching ZPL_GEN is RCT_HARDLINK_DELETE (link removed
+ *   but dnode persists via other links).
+ */
+static int
+rebase_collapse_changelist(rebase_changelist_t *rcl,
+    objset_t *base_os, objset_t *side_os)
+{
+	rebase_change_t *rc;
+	int err;
+
+	/* Pass 1: move detection — collapse ADD+DELETE pairs. */
+	rc = avl_first(&rcl->rcl_by_obj);
+	while (rc != NULL) {
+		uint64_t obj = rc->rc_obj;
+		rebase_change_t *add = NULL, *del = NULL;
+		rebase_change_t *p;
+
+		/*
+		 * Scan all entries in this obj# group, finding
+		 * the first ADD and first DELETE.  After the loop,
+		 * p points to the first entry of the next group.
+		 */
+		for (p = rc; p != NULL && p->rc_obj == obj;
+		    p = AVL_NEXT(&rcl->rcl_by_obj, p)) {
+			if (p->rc_type == RCT_ADD && add == NULL)
+				add = p;
+			else if (p->rc_type == RCT_DELETE &&
+			    del == NULL)
+				del = p;
+		}
+
+		if (add != NULL && del != NULL) {
+			boolean_t same;
+
+			err = rebase_same_gen(base_os, side_os,
+			    obj, &same);
+			if (err != 0)
+				return (err);
+
+			if (same) {
+				boolean_t hyst;
+
+				err = rebase_is_hysterical(base_os,
+				    obj, side_os, obj, &hyst);
+				if (err != 0)
+					return (err);
+
+				add->rc_type = hyst ?
+				    RCT_MOVE : RCT_MOVE_EDIT;
+				add->rc_old_path = del->rc_path;
+				add->rc_old_pathlen =
+				    del->rc_pathlen;
+
+				avl_remove(&rcl->rcl_by_path, del);
+				avl_remove(&rcl->rcl_by_obj, del);
+				del->rc_path = NULL;
+				kmem_free(del, sizeof (*del));
+				rcl->rcl_count--;
+			}
+		}
+
+		rc = p;
+	}
+
+	/* Pass 2: hardlink detection. */
+	for (rc = avl_first(&rcl->rcl_by_obj); rc != NULL;
+	    rc = AVL_NEXT(&rcl->rcl_by_obj, rc)) {
+		boolean_t same;
+
+		if (rc->rc_type == RCT_ADD) {
+			err = rebase_same_gen(base_os, side_os,
+			    rc->rc_obj, &same);
+			if (err != 0)
+				return (err);
+			if (same)
+				rc->rc_type = RCT_HARDLINK_ADD;
+		} else if (rc->rc_type == RCT_DELETE) {
+			err = rebase_same_gen(base_os, side_os,
+			    rc->rc_obj, &same);
+			if (err != 0)
+				return (err);
+			if (same)
+				rc->rc_type = RCT_HARDLINK_DELETE;
+		}
+	}
+
+	return (0);
+}
+
+/*
+ * Run the collapse phase on both changelists.
+ */
+static int
+rebase_collapse(rebase_state_t *rs)
+{
+	int err;
+
+	err = rebase_collapse_changelist(&rs->rs_left_changes,
+	    rs->rs_base_os, rs->rs_left_os);
+	if (err != 0)
+		return (err);
+
+	return (rebase_collapse_changelist(&rs->rs_right_changes,
+	    rs->rs_base_os, rs->rs_right_os));
+}
+
 int
 dsl_rebase(const char *left_ds, const char *right_ds, nvlist_t *outnvl)
 {
@@ -1235,11 +1412,16 @@ dsl_rebase(const char *left_ds, const char *right_ds, nvlist_t *outnvl)
 
 	/* Diff phase: populate changelists. */
 	err = rebase_diff(&state);
+
+	/* Collapse phase: detect moves and hardlinks. */
+	if (err == 0)
+		err = rebase_collapse(&state);
+
 	if (err == 0) {
 		/*
-		 * Changelists populated.  Subsequent issues will
-		 * fill in collapse, cross-reference, apply, and
-		 * emit phases here.
+		 * Changelists collapsed.  Subsequent issues will
+		 * fill in cross-reference, apply, and emit phases
+		 * here.
 		 */
 		err = SET_ERROR(ENOSYS);
 	}
