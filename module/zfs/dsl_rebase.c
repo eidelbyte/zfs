@@ -1807,6 +1807,309 @@ rebase_crossref(rebase_state_t *rs)
 	return (0);
 }
 
+/*
+ * Copy a ZPL object from one objset to another.
+ *
+ * Allocates an appropriate new DMU object in dst_os (ZAP for
+ * directories, plain file for everything else), copies all SA
+ * attributes from the source with ZPL_PARENT overridden and
+ * ZPL_XATTR zeroed, then copies file data block-by-block for
+ * non-directory objects.  Variable-length SA attributes
+ * (symlink targets, ACLs, inline xattrs) are preserved.
+ *
+ * The caller is responsible for:
+ *   - Adding the ZAP entry in the parent directory
+ *   - Copying xattr=dir subtrees and setting ZPL_XATTR
+ *   - Recursively copying directory children
+ */
+static int
+rebase_copy_object(objset_t *src_os, uint64_t src_obj,
+    objset_t *dst_os, uint64_t parent_obj,
+    uint64_t *dst_obj_out, dmu_tx_t *tx)
+{
+	dmu_object_info_t doi;
+	sa_handle_t *src_hdl = NULL, *dst_hdl = NULL;
+	sa_attr_type_t *sa_tbl;
+	sa_bulk_attr_t attrs[20];
+	uint64_t dst_obj;
+	int cnt = 0;
+	int err;
+
+	uint64_t mode, size, gen, uid, gid, parent, pflags;
+	uint64_t links, rdev, dacl_count, projid, xattr_obj;
+	uint64_t atime[2], mtime[2], ctime[2], crtime[2];
+
+	/* Variable-length attr buffers (allocated on demand). */
+	void *symlink_buf = NULL;
+	void *acl_buf = NULL;
+	void *dxattr_buf = NULL;
+	int symlink_sz = 0, acl_sz = 0, dxattr_sz = 0;
+
+	*dst_obj_out = 0;
+
+	err = dmu_object_info(src_os, src_obj, &doi);
+	if (err != 0)
+		return (err);
+
+	if (doi.doi_type == DMU_OT_DIRECTORY_CONTENTS) {
+		dst_obj = zap_create_norm(dst_os, 0,
+		    DMU_OT_DIRECTORY_CONTENTS,
+		    DMU_OT_SA, DN_BONUS_SIZE(DNODE_MIN_SIZE), tx);
+	} else {
+		dst_obj = dmu_object_alloc(dst_os,
+		    DMU_OT_PLAIN_FILE_CONTENTS, 0,
+		    DMU_OT_SA, DN_BONUS_SIZE(DNODE_MIN_SIZE), tx);
+	}
+
+	err = sa_handle_get(src_os, src_obj, NULL,
+	    SA_HDL_PRIVATE, &src_hdl);
+	if (err != 0)
+		return (err);
+
+	err = sa_handle_get(dst_os, dst_obj, NULL,
+	    SA_HDL_PRIVATE, &dst_hdl);
+	if (err != 0) {
+		sa_handle_destroy(src_hdl);
+		return (err);
+	}
+
+	sa_tbl = dst_os->os_sa->sa_user_table;
+
+	/* Copy fixed-size SA attributes from source. */
+#define	SA_COPY_UINT64(attr, var)					\
+	do {								\
+		(void) sa_lookup(src_hdl, sa_tbl[(attr)],		\
+		    &(var), sizeof (var));				\
+		SA_ADD_BULK_ATTR(attrs, cnt, sa_tbl[(attr)],		\
+		    NULL, &(var), sizeof (var));				\
+	} while (0)
+
+#define	SA_COPY_PAIR(attr, var)						\
+	do {								\
+		(void) sa_lookup(src_hdl, sa_tbl[(attr)],		\
+		    (var), sizeof (var));				\
+		SA_ADD_BULK_ATTR(attrs, cnt, sa_tbl[(attr)],		\
+		    NULL, (var), sizeof (var));				\
+	} while (0)
+
+	mode = size = gen = uid = gid = parent = pflags = 0;
+	links = rdev = dacl_count = projid = xattr_obj = 0;
+	memset(atime, 0, sizeof (atime));
+	memset(mtime, 0, sizeof (mtime));
+	memset(ctime, 0, sizeof (ctime));
+	memset(crtime, 0, sizeof (crtime));
+
+	SA_COPY_UINT64(ZPL_MODE, mode);
+	SA_COPY_UINT64(ZPL_SIZE, size);
+	SA_COPY_UINT64(ZPL_GEN, gen);
+	SA_COPY_UINT64(ZPL_UID, uid);
+	SA_COPY_UINT64(ZPL_GID, gid);
+	SA_COPY_UINT64(ZPL_LINKS, links);
+	SA_COPY_UINT64(ZPL_FLAGS, pflags);
+	SA_COPY_UINT64(ZPL_RDEV, rdev);
+	SA_COPY_UINT64(ZPL_DACL_COUNT, dacl_count);
+	SA_COPY_UINT64(ZPL_PROJID, projid);
+	SA_COPY_PAIR(ZPL_ATIME, atime);
+	SA_COPY_PAIR(ZPL_MTIME, mtime);
+	SA_COPY_PAIR(ZPL_CTIME, ctime);
+	SA_COPY_PAIR(ZPL_CRTIME, crtime);
+
+	parent = parent_obj;
+	SA_ADD_BULK_ATTR(attrs, cnt, sa_tbl[ZPL_PARENT],
+	    NULL, &parent, sizeof (parent));
+
+	/* ZPL_XATTR is zeroed — caller copies xattr dir separately. */
+	xattr_obj = 0;
+	SA_ADD_BULK_ATTR(attrs, cnt, sa_tbl[ZPL_XATTR],
+	    NULL, &xattr_obj, sizeof (xattr_obj));
+
+#undef SA_COPY_UINT64
+#undef SA_COPY_PAIR
+
+	/* Copy variable-length SA attributes if present. */
+	if (sa_size(src_hdl, sa_tbl[ZPL_SYMLINK],
+	    &symlink_sz) == 0 && symlink_sz > 0) {
+		symlink_buf = kmem_alloc(symlink_sz, KM_SLEEP);
+		(void) sa_lookup(src_hdl, sa_tbl[ZPL_SYMLINK],
+		    symlink_buf, symlink_sz);
+		SA_ADD_BULK_ATTR(attrs, cnt, sa_tbl[ZPL_SYMLINK],
+		    NULL, symlink_buf, symlink_sz);
+	}
+
+	if (sa_size(src_hdl, sa_tbl[ZPL_DACL_ACES],
+	    &acl_sz) == 0 && acl_sz > 0) {
+		acl_buf = kmem_alloc(acl_sz, KM_SLEEP);
+		(void) sa_lookup(src_hdl, sa_tbl[ZPL_DACL_ACES],
+		    acl_buf, acl_sz);
+		SA_ADD_BULK_ATTR(attrs, cnt, sa_tbl[ZPL_DACL_ACES],
+		    NULL, acl_buf, acl_sz);
+	}
+
+	if (sa_size(src_hdl, sa_tbl[ZPL_DXATTR],
+	    &dxattr_sz) == 0 && dxattr_sz > 0) {
+		dxattr_buf = kmem_alloc(dxattr_sz, KM_SLEEP);
+		(void) sa_lookup(src_hdl, sa_tbl[ZPL_DXATTR],
+		    dxattr_buf, dxattr_sz);
+		SA_ADD_BULK_ATTR(attrs, cnt, sa_tbl[ZPL_DXATTR],
+		    NULL, dxattr_buf, dxattr_sz);
+	}
+
+	err = sa_replace_all_by_template(dst_hdl, attrs, cnt, tx);
+	sa_handle_destroy(dst_hdl);
+	sa_handle_destroy(src_hdl);
+
+	if (symlink_buf != NULL)
+		kmem_free(symlink_buf, symlink_sz);
+	if (acl_buf != NULL)
+		kmem_free(acl_buf, acl_sz);
+	if (dxattr_buf != NULL)
+		kmem_free(dxattr_buf, dxattr_sz);
+
+	if (err != 0)
+		return (err);
+
+	/* Copy file data block by block (directories have no data). */
+	if (doi.doi_type != DMU_OT_DIRECTORY_CONTENTS &&
+	    doi.doi_max_offset > 0) {
+		uint64_t blksz = doi.doi_data_block_size;
+		uint64_t offset = 0;
+		void *buf;
+
+		if (blksz == 0)
+			blksz = SPA_OLD_MAXBLOCKSIZE;
+
+		buf = kmem_alloc(blksz, KM_SLEEP);
+
+		while (offset < doi.doi_max_offset) {
+			uint64_t chunk = MIN(blksz,
+			    doi.doi_max_offset - offset);
+
+			err = dmu_read(src_os, src_obj, offset,
+			    chunk, buf, DMU_READ_NO_PREFETCH);
+			if (err != 0)
+				break;
+
+			dmu_write(dst_os, dst_obj, offset,
+			    chunk, buf, tx, 0);
+			offset += chunk;
+		}
+
+		kmem_free(buf, blksz);
+		if (err != 0)
+			return (err);
+	}
+
+	*dst_obj_out = dst_obj;
+	return (0);
+}
+
+/*
+ * Deep-copy an xattr=dir hidden directory from one objset to another.
+ *
+ * Uses rebase_copy_object() to clone the directory dnode (which
+ * preserves the ZFS_XATTR flag from the source's ZPL_FLAGS), then
+ * iterates the source ZAP and copies each child value object into
+ * the new directory.
+ *
+ * The caller must have already held the tx with sufficient holds
+ * for the expected number of new objects.
+ *
+ * Returns the new xattr directory's object number via *dst_obj_out.
+ */
+static int
+rebase_copy_xattr_dir(objset_t *src_os, uint64_t src_xattr_obj,
+    objset_t *dst_os, uint64_t parent_obj,
+    uint64_t *dst_obj_out, dmu_tx_t *tx)
+{
+	zap_attribute_t *za;
+	zap_cursor_t zc;
+	uint64_t dst_dir;
+	int err;
+
+	*dst_obj_out = 0;
+
+	err = rebase_copy_object(src_os, src_xattr_obj,
+	    dst_os, parent_obj, &dst_dir, tx);
+	if (err != 0)
+		return (err);
+
+	za = zap_attribute_alloc();
+
+	for (zap_cursor_init(&zc, src_os, src_xattr_obj);
+	    (err = zap_cursor_retrieve(&zc, za)) == 0;
+	    zap_cursor_advance(&zc)) {
+		uint64_t child_obj =
+		    ZFS_DIRENT_OBJ(za->za_first_integer);
+		uint64_t new_obj;
+
+		err = rebase_copy_object(src_os, child_obj,
+		    dst_os, dst_dir, &new_obj, tx);
+		if (err != 0)
+			break;
+
+		{
+			uint64_t dirent = ZFS_DIRENT_MAKE(
+			    ZFS_DIRENT_TYPE(za->za_first_integer),
+			    new_obj);
+			err = zap_add(dst_os, dst_dir,
+			    za->za_name, 8, 1, &dirent, tx);
+		}
+		if (err != 0)
+			break;
+	}
+
+	if (err == ENOENT)
+		err = 0;
+
+	zap_cursor_fini(&zc);
+	zap_attribute_free(za);
+
+	if (err == 0)
+		*dst_obj_out = dst_dir;
+
+	return (err);
+}
+
+/*
+ * Free all children of an xattr=dir hidden directory and the
+ * directory itself.
+ *
+ * Iterates the ZAP, calls dmu_object_free() on each child value
+ * object, then frees the directory object.  The caller provides
+ * the open tx.
+ */
+static int
+rebase_free_xattr_dir(objset_t *os, uint64_t xattr_obj, dmu_tx_t *tx)
+{
+	zap_attribute_t *za;
+	zap_cursor_t zc;
+	int err;
+
+	za = zap_attribute_alloc();
+
+	for (zap_cursor_init(&zc, os, xattr_obj);
+	    (err = zap_cursor_retrieve(&zc, za)) == 0;
+	    zap_cursor_advance(&zc)) {
+		uint64_t child_obj =
+		    ZFS_DIRENT_OBJ(za->za_first_integer);
+
+		err = dmu_object_free(os, child_obj, tx);
+		if (err != 0)
+			break;
+	}
+
+	if (err == ENOENT)
+		err = 0;
+
+	zap_cursor_fini(&zc);
+	zap_attribute_free(za);
+
+	if (err != 0)
+		return (err);
+
+	return (dmu_object_free(os, xattr_obj, tx));
+}
+
 int
 dsl_rebase(const char *left_ds, const char *right_ds, nvlist_t *outnvl)
 {
