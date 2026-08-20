@@ -40,6 +40,7 @@
 #include <sys/sa.h>
 #include <sys/zfs_sa.h>
 #include <sys/dnode.h>
+#include <sys/dsl_destroy.h>
 
 /*
  * Snapshot chain entry for common-ancestor discovery.
@@ -2110,6 +2111,343 @@ rebase_free_xattr_dir(objset_t *os, uint64_t xattr_obj, dmu_tx_t *tx)
 	return (dmu_object_free(os, xattr_obj, tx));
 }
 
+/*
+ * Resolve a ZPL path to its parent directory's object number and
+ * extract the final component name.  Paths are relative to the
+ * dataset root with no leading slash (e.g. "dir/subdir/file").
+ *
+ * Walks from root_obj, doing a zap_lookup for each component
+ * except the last.  Returns the parent dir obj# via *parent_out
+ * and sets *name_out to point into the original path string at
+ * the final component.
+ */
+static int
+rebase_resolve_parent(objset_t *os, uint64_t root_obj,
+    const char *path, uint64_t *parent_out, const char **name_out)
+{
+	const char *last_slash;
+	const char *p, *end;
+	uint64_t dir_obj = root_obj;
+
+	last_slash = strrchr(path, '/');
+
+	if (last_slash == NULL) {
+		*parent_out = root_obj;
+		*name_out = path;
+		return (0);
+	}
+
+	*name_out = last_slash + 1;
+
+	p = path;
+	while (p < last_slash) {
+		uint64_t dirent;
+		char compbuf[MAXNAMELEN];
+		size_t clen;
+		int err;
+
+		end = memchr(p, '/', last_slash - p);
+		if (end == NULL)
+			end = last_slash;
+
+		clen = end - p;
+		if (clen == 0 || clen >= MAXNAMELEN)
+			return (SET_ERROR(EINVAL));
+
+		memcpy(compbuf, p, clen);
+		compbuf[clen] = '\0';
+
+		err = zap_lookup(os, dir_obj, compbuf, 8, 1, &dirent);
+		if (err != 0)
+			return (err);
+
+		dir_obj = ZFS_DIRENT_OBJ(dirent);
+		p = end + 1;
+	}
+
+	*parent_out = dir_obj;
+	return (0);
+}
+
+/*
+ * Apply right-only additions to the left HEAD.
+ *
+ * Two passes over the right changelist (path-ordered):
+ *   1. RCT_ADD — copy the object from right into HEAD via
+ *      rebase_copy_object(), add the directory entry, and copy
+ *      xattr=dir subtrees if present.
+ *   2. RCT_HARDLINK_ADD — add a directory entry pointing to the
+ *      existing dnode in HEAD (shared from base via COW),
+ *      increment ZPL_LINKS.
+ *
+ * Entries that have a matching path in the left changelist are
+ * skipped — they are either conflicts (recorded in the manifest)
+ * or identical changes (left version already in HEAD).
+ *
+ * Path ordering ensures parent directories are created before
+ * their children.
+ */
+static int
+rebase_apply_additions(rebase_state_t *rs)
+{
+	rebase_changelist_t *right = &rs->rs_right_changes;
+	rebase_changelist_t *left = &rs->rs_left_changes;
+	objset_t *dst_os = rs->rs_left_os;
+	objset_t *src_os = rs->rs_right_os;
+	sa_attr_type_t *src_sa = src_os->os_sa->sa_user_table;
+	sa_attr_type_t *dst_sa = dst_os->os_sa->sa_user_table;
+	rebase_change_t *rc;
+	int err = 0;
+
+	/* Pass 1: regular additions. */
+	for (rc = avl_first(&right->rcl_by_path); rc != NULL;
+	    rc = AVL_NEXT(&right->rcl_by_path, rc)) {
+		uint64_t parent_obj, new_obj, src_xattr, mode;
+		uint64_t psize, plinks;
+		const char *name;
+		sa_handle_t *src_hdl, *par_hdl;
+		dmu_object_info_t doi;
+		dmu_tx_t *tx;
+
+		if (rc->rc_type != RCT_ADD)
+			continue;
+
+		/* Skip if left also changed this path. */
+		{
+			rebase_change_t search;
+			avl_index_t where;
+			search.rc_path = rc->rc_path;
+			if (avl_find(&left->rcl_by_path,
+			    &search, &where) != NULL)
+				continue;
+		}
+
+		err = rebase_resolve_parent(dst_os, rs->rs_left_root,
+		    rc->rc_path, &parent_obj, &name);
+		if (err == ENOENT)
+			continue;
+		if (err != 0)
+			return (err);
+
+		err = dmu_object_info(src_os, rc->rc_obj, &doi);
+		if (err != 0)
+			return (err);
+
+		/* Read source mode and xattr dir obj#. */
+		err = sa_handle_get(src_os, rc->rc_obj, NULL,
+		    SA_HDL_PRIVATE, &src_hdl);
+		if (err != 0)
+			return (err);
+
+		mode = 0;
+		src_xattr = 0;
+		(void) sa_lookup(src_hdl, src_sa[ZPL_MODE],
+		    &mode, sizeof (mode));
+		(void) sa_lookup(src_hdl, src_sa[ZPL_XATTR],
+		    &src_xattr, sizeof (src_xattr));
+		sa_handle_destroy(src_hdl);
+
+		/* Get parent dir SA handle for size/links update. */
+		err = sa_handle_get(dst_os, parent_obj, NULL,
+		    SA_HDL_PRIVATE, &par_hdl);
+		if (err != 0)
+			return (err);
+
+		/* Build transaction with holds for copy + dirent. */
+		tx = dmu_tx_create(dst_os);
+		dmu_tx_hold_zap(tx, parent_obj, B_TRUE, name);
+		dmu_tx_hold_sa(tx, par_hdl, B_FALSE);
+		dmu_tx_hold_sa_create(tx, DN_BONUS_SIZE(DNODE_MIN_SIZE));
+
+		if (doi.doi_type == DMU_OT_DIRECTORY_CONTENTS)
+			dmu_tx_hold_zap(tx, DMU_NEW_OBJECT,
+			    B_TRUE, NULL);
+
+		if (doi.doi_type != DMU_OT_DIRECTORY_CONTENTS &&
+		    doi.doi_max_offset > 0)
+			dmu_tx_hold_write(tx, DMU_NEW_OBJECT,
+			    0, doi.doi_max_offset);
+
+		if (src_xattr != 0) {
+			dmu_tx_hold_zap(tx, DMU_NEW_OBJECT,
+			    B_TRUE, NULL);
+			dmu_tx_hold_sa_create(tx,
+			    DN_BONUS_SIZE(DNODE_MIN_SIZE));
+		}
+
+		err = dmu_tx_assign(tx, DMU_TX_WAIT);
+		if (err != 0) {
+			dmu_tx_abort(tx);
+			sa_handle_destroy(par_hdl);
+			return (err);
+		}
+
+		err = rebase_copy_object(src_os, rc->rc_obj,
+		    dst_os, parent_obj, &new_obj, tx);
+		if (err != 0) {
+			sa_handle_destroy(par_hdl);
+			dmu_tx_commit(tx);
+			return (err);
+		}
+
+		{
+			uint64_t dirent = ZFS_DIRENT_MAKE(
+			    IFTODT(mode & S_IFMT), new_obj);
+			err = zap_add(dst_os, parent_obj, name,
+			    8, 1, &dirent, tx);
+		}
+		if (err != 0) {
+			sa_handle_destroy(par_hdl);
+			dmu_tx_commit(tx);
+			return (err);
+		}
+
+		/* Update parent directory's size and link count. */
+		psize = 0;
+		(void) sa_lookup(par_hdl, dst_sa[ZPL_SIZE],
+		    &psize, sizeof (psize));
+		psize++;
+		err = sa_update(par_hdl, dst_sa[ZPL_SIZE],
+		    &psize, sizeof (psize), tx);
+
+		if (err == 0 &&
+		    doi.doi_type == DMU_OT_DIRECTORY_CONTENTS) {
+			plinks = 0;
+			(void) sa_lookup(par_hdl, dst_sa[ZPL_LINKS],
+			    &plinks, sizeof (plinks));
+			plinks++;
+			err = sa_update(par_hdl, dst_sa[ZPL_LINKS],
+			    &plinks, sizeof (plinks), tx);
+		}
+
+		sa_handle_destroy(par_hdl);
+
+		if (err != 0) {
+			dmu_tx_commit(tx);
+			return (err);
+		}
+
+		if (src_xattr != 0) {
+			uint64_t new_xattr;
+			sa_handle_t *dst_hdl;
+
+			err = rebase_copy_xattr_dir(src_os,
+			    src_xattr, dst_os, new_obj,
+			    &new_xattr, tx);
+			if (err == 0) {
+				err = sa_handle_get(dst_os, new_obj,
+				    NULL, SA_HDL_PRIVATE, &dst_hdl);
+				if (err == 0) {
+					err = sa_update(dst_hdl,
+					    dst_sa[ZPL_XATTR],
+					    &new_xattr,
+					    sizeof (new_xattr), tx);
+					sa_handle_destroy(dst_hdl);
+				}
+			}
+			if (err != 0) {
+				dmu_tx_commit(tx);
+				return (err);
+			}
+		}
+
+		dmu_tx_commit(tx);
+	}
+
+	/* Pass 2: hardlink additions. */
+	for (rc = avl_first(&right->rcl_by_path); rc != NULL;
+	    rc = AVL_NEXT(&right->rcl_by_path, rc)) {
+		uint64_t parent_obj, mode, links, psize;
+		const char *name;
+		sa_handle_t *hdl, *par_hdl;
+		dmu_tx_t *tx;
+
+		if (rc->rc_type != RCT_HARDLINK_ADD)
+			continue;
+
+		{
+			rebase_change_t search;
+			avl_index_t where;
+			search.rc_path = rc->rc_path;
+			if (avl_find(&left->rcl_by_path,
+			    &search, &where) != NULL)
+				continue;
+		}
+
+		err = rebase_resolve_parent(dst_os, rs->rs_left_root,
+		    rc->rc_path, &parent_obj, &name);
+		if (err == ENOENT)
+			continue;
+		if (err != 0)
+			return (err);
+
+		/*
+		 * The dnode already exists in HEAD (shared from base
+		 * via COW).  Read its mode and link count.
+		 */
+		err = sa_handle_get(dst_os, rc->rc_obj, NULL,
+		    SA_HDL_PRIVATE, &hdl);
+		if (err != 0)
+			return (err);
+
+		mode = 0;
+		links = 0;
+		(void) sa_lookup(hdl, dst_sa[ZPL_MODE],
+		    &mode, sizeof (mode));
+		(void) sa_lookup(hdl, dst_sa[ZPL_LINKS],
+		    &links, sizeof (links));
+
+		err = sa_handle_get(dst_os, parent_obj, NULL,
+		    SA_HDL_PRIVATE, &par_hdl);
+		if (err != 0) {
+			sa_handle_destroy(hdl);
+			return (err);
+		}
+
+		tx = dmu_tx_create(dst_os);
+		dmu_tx_hold_zap(tx, parent_obj, B_TRUE, name);
+		dmu_tx_hold_sa(tx, hdl, B_FALSE);
+		dmu_tx_hold_sa(tx, par_hdl, B_FALSE);
+
+		err = dmu_tx_assign(tx, DMU_TX_WAIT);
+		if (err != 0) {
+			dmu_tx_abort(tx);
+			sa_handle_destroy(par_hdl);
+			sa_handle_destroy(hdl);
+			return (err);
+		}
+
+		{
+			uint64_t dirent = ZFS_DIRENT_MAKE(
+			    IFTODT(mode & S_IFMT), rc->rc_obj);
+			err = zap_add(dst_os, parent_obj, name,
+			    8, 1, &dirent, tx);
+		}
+		if (err == 0) {
+			links++;
+			err = sa_update(hdl, dst_sa[ZPL_LINKS],
+			    &links, sizeof (links), tx);
+		}
+		if (err == 0) {
+			psize = 0;
+			(void) sa_lookup(par_hdl, dst_sa[ZPL_SIZE],
+			    &psize, sizeof (psize));
+			psize++;
+			err = sa_update(par_hdl, dst_sa[ZPL_SIZE],
+			    &psize, sizeof (psize), tx);
+		}
+
+		sa_handle_destroy(par_hdl);
+		sa_handle_destroy(hdl);
+		dmu_tx_commit(tx);
+
+		if (err != 0)
+			return (err);
+	}
+
+	return (0);
+}
+
 int
 dsl_rebase(const char *left_ds, const char *right_ds, nvlist_t *outnvl)
 {
@@ -2239,11 +2577,48 @@ dsl_rebase(const char *left_ds, const char *right_ds, nvlist_t *outnvl)
 		/*
 		 * Diff engine complete.  Serialize the manifest so
 		 * the caller can inspect conflicts and changelist
-		 * counts.  The apply phase will land here.
+		 * counts.
 		 */
 		if (outnvl != NULL)
 			rebase_manifest_to_nvl(&state, outnvl);
-		err = SET_ERROR(ENOSYS);
+
+		/*
+		 * Apply phase: take a fence-post snapshot of the
+		 * left HEAD as a universal rollback target, then
+		 * apply non-conflicting right-side changes.
+		 */
+		err = dmu_objset_snapshot_one(left_ds,
+		    ZFS_REBASE_SNAP_SUFFIX);
+		if (err == 0)
+			err = rebase_apply_additions(&state);
+
+		if (err != 0) {
+			char *snap_name;
+			int rerr;
+
+			/*
+			 * Rollback to @%rebase-snap, then destroy it.
+			 * Ignore rollback/destroy errors — the
+			 * original error is more important.
+			 */
+			snap_name = kmem_asprintf("%s@%s", left_ds,
+			    ZFS_REBASE_SNAP_SUFFIX);
+			rerr = dsl_dataset_rollback(left_ds,
+			    snap_name, NULL, NULL);
+			if (rerr == 0)
+				(void) dsl_destroy_snapshot(snap_name,
+				    B_FALSE);
+			kmem_strfree(snap_name);
+		} else {
+			/*
+			 * Additions applied.  More apply phases
+			 * (deletions, edits, structural) not yet
+			 * implemented — return ENOSYS but leave
+			 * the snapshot and applied changes in place
+			 * so tests can verify the additions.
+			 */
+			err = SET_ERROR(ENOSYS);
+		}
 	}
 
 	rebase_manifest_fini(&state.rs_manifest);
