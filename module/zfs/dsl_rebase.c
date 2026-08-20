@@ -1295,6 +1295,455 @@ rebase_collapse(rebase_state_t *rs)
 	    rs->rs_base_os, rs->rs_right_os));
 }
 
+/*
+ * ================================================================
+ * Cross-reference phase — conflict detection
+ * ================================================================
+ */
+
+static void
+rebase_manifest_init(rebase_manifest_t *rm)
+{
+	list_create(&rm->rm_conflicts, sizeof (rebase_conflict_t),
+	    offsetof(rebase_conflict_t, rcf_node));
+	rm->rm_nconflicts = 0;
+}
+
+static void
+rebase_manifest_fini(rebase_manifest_t *rm)
+{
+	rebase_conflict_t *rcf;
+
+	while ((rcf = list_remove_head(&rm->rm_conflicts)) != NULL) {
+		kmem_free(rcf->rcf_path, rcf->rcf_pathlen);
+		for (uint_t i = 0; i < rcf->rcf_nalt; i++)
+			kmem_free(rcf->rcf_alt_paths[i],
+			    strlen(rcf->rcf_alt_paths[i]) + 1);
+		if (rcf->rcf_alt_paths != NULL)
+			kmem_free(rcf->rcf_alt_paths,
+			    rcf->rcf_nalt * sizeof (char *));
+		kmem_free(rcf, sizeof (*rcf));
+	}
+	list_destroy(&rm->rm_conflicts);
+}
+
+/*
+ * Find an existing conflict record for the given dnode object.
+ * Used for hardlink deduplication — multiple paths to the same
+ * dnode share a single conflict entry.
+ */
+static rebase_conflict_t *
+rebase_manifest_find_obj(rebase_manifest_t *rm, uint64_t obj)
+{
+	rebase_conflict_t *rcf;
+
+	for (rcf = list_head(&rm->rm_conflicts);
+	    rcf != NULL; rcf = list_next(&rm->rm_conflicts, rcf)) {
+		if (rcf->rcf_obj == obj)
+			return (rcf);
+	}
+	return (NULL);
+}
+
+/*
+ * Add a path to an existing conflict's alt_paths array.
+ */
+static void
+rebase_conflict_add_alt(rebase_conflict_t *rcf,
+    const char *path, size_t pathlen)
+{
+	uint_t n = rcf->rcf_nalt + 1;
+	char **new_paths;
+
+	new_paths = kmem_alloc(n * sizeof (char *), KM_SLEEP);
+	if (rcf->rcf_alt_paths != NULL) {
+		memcpy(new_paths, rcf->rcf_alt_paths,
+		    rcf->rcf_nalt * sizeof (char *));
+		kmem_free(rcf->rcf_alt_paths,
+		    rcf->rcf_nalt * sizeof (char *));
+	}
+
+	new_paths[rcf->rcf_nalt] = kmem_alloc(pathlen, KM_SLEEP);
+	memcpy(new_paths[rcf->rcf_nalt], path, pathlen);
+
+	rcf->rcf_alt_paths = new_paths;
+	rcf->rcf_nalt = n;
+}
+
+/*
+ * Record a conflict in the manifest. Deduplicates by dnode
+ * object number — if this obj already has a conflict, the
+ * path is added as an alternate path instead.
+ */
+static void
+rebase_record_conflict(rebase_manifest_t *rm,
+    rebase_conflict_type_t type, uint64_t obj,
+    const char *path, size_t pathlen)
+{
+	rebase_conflict_t *existing;
+	rebase_conflict_t *rcf;
+
+	existing = rebase_manifest_find_obj(rm, obj);
+	if (existing != NULL) {
+		rebase_conflict_add_alt(existing, path, pathlen);
+		return;
+	}
+
+	rcf = kmem_zalloc(sizeof (*rcf), KM_SLEEP);
+	rcf->rcf_type = type;
+	rcf->rcf_obj = obj;
+	rcf->rcf_pathlen = pathlen;
+	rcf->rcf_path = kmem_alloc(pathlen, KM_SLEEP);
+	memcpy(rcf->rcf_path, path, pathlen);
+
+	list_insert_tail(&rm->rm_conflicts, rcf);
+	rm->rm_nconflicts++;
+}
+
+/*
+ * Classify a conflict for two entries at the same resolved path.
+ */
+static int
+rebase_crossref_samepath(rebase_state_t *rs,
+    rebase_change_t *lrc, rebase_change_t *rrc)
+{
+	boolean_t same;
+	int err;
+
+	/* Both EDIT — check for identical changes before flagging. */
+	if ((lrc->rc_type == RCT_EDIT ||
+	    lrc->rc_type == RCT_MOVE_EDIT) &&
+	    (rrc->rc_type == RCT_EDIT ||
+	    rrc->rc_type == RCT_MOVE_EDIT)) {
+		err = rebase_is_hysterical(rs->rs_left_os, lrc->rc_obj,
+		    rs->rs_right_os, rrc->rc_obj, &same);
+		if (err != 0)
+			return (err);
+		if (same)
+			return (0);
+
+		rebase_record_conflict(&rs->rs_manifest,
+		    RCONF_BOTH_MODIFIED, lrc->rc_obj,
+		    lrc->rc_path, lrc->rc_pathlen);
+		return (0);
+	}
+
+	/* Both ADD — check for identical content before flagging. */
+	if ((lrc->rc_type == RCT_ADD ||
+	    lrc->rc_type == RCT_HARDLINK_ADD) &&
+	    (rrc->rc_type == RCT_ADD ||
+	    rrc->rc_type == RCT_HARDLINK_ADD)) {
+		err = rebase_is_hysterical(rs->rs_left_os, lrc->rc_obj,
+		    rs->rs_right_os, rrc->rc_obj, &same);
+		if (err != 0)
+			return (err);
+		if (same)
+			return (0);
+
+		rebase_record_conflict(&rs->rs_manifest,
+		    RCONF_CREATE_CREATE, lrc->rc_obj,
+		    lrc->rc_path, lrc->rc_pathlen);
+		return (0);
+	}
+
+	/* Left EDIT, right DELETE — modify-delete. */
+	if ((lrc->rc_type == RCT_EDIT ||
+	    lrc->rc_type == RCT_MOVE_EDIT) &&
+	    (rrc->rc_type == RCT_DELETE ||
+	    rrc->rc_type == RCT_HARDLINK_DELETE)) {
+		rebase_record_conflict(&rs->rs_manifest,
+		    RCONF_MODIFY_DELETE, lrc->rc_obj,
+		    lrc->rc_path, lrc->rc_pathlen);
+		return (0);
+	}
+
+	/* Left DELETE, right EDIT — delete-modify. */
+	if ((lrc->rc_type == RCT_DELETE ||
+	    lrc->rc_type == RCT_HARDLINK_DELETE) &&
+	    (rrc->rc_type == RCT_EDIT ||
+	    rrc->rc_type == RCT_MOVE_EDIT)) {
+		rebase_record_conflict(&rs->rs_manifest,
+		    RCONF_DELETE_MODIFY, rrc->rc_obj,
+		    rrc->rc_path, rrc->rc_pathlen);
+		return (0);
+	}
+
+	/* Both DELETE — not a conflict. */
+	if ((lrc->rc_type == RCT_DELETE ||
+	    lrc->rc_type == RCT_HARDLINK_DELETE) &&
+	    (rrc->rc_type == RCT_DELETE ||
+	    rrc->rc_type == RCT_HARDLINK_DELETE)) {
+		return (0);
+	}
+
+	/* Both sides moved something to this path. */
+	if ((lrc->rc_type == RCT_MOVE ||
+	    lrc->rc_type == RCT_MOVE_EDIT) &&
+	    (rrc->rc_type == RCT_MOVE ||
+	    rrc->rc_type == RCT_MOVE_EDIT)) {
+		if (lrc->rc_obj != rrc->rc_obj) {
+			rebase_record_conflict(&rs->rs_manifest,
+			    RCONF_MOVE_DIVERGE, lrc->rc_obj,
+			    lrc->rc_path, lrc->rc_pathlen);
+			return (0);
+		}
+
+		/*
+		 * Same dnode, same destination.  If both sides also
+		 * edited content, check whether the edits are identical.
+		 */
+		if (lrc->rc_type == RCT_MOVE_EDIT &&
+		    rrc->rc_type == RCT_MOVE_EDIT) {
+			err = rebase_is_hysterical(rs->rs_left_os,
+			    lrc->rc_obj, rs->rs_right_os,
+			    rrc->rc_obj, &same);
+			if (err != 0)
+				return (err);
+			if (!same) {
+				rebase_record_conflict(&rs->rs_manifest,
+				    RCONF_BOTH_MODIFIED, lrc->rc_obj,
+				    lrc->rc_path, lrc->rc_pathlen);
+			}
+		}
+		return (0);
+	}
+
+	/*
+	 * MOVE destination collides with the other side's entry.
+	 * One side moved a file TO this path; the other side has
+	 * a change AT this path.
+	 */
+	if (lrc->rc_type == RCT_MOVE ||
+	    lrc->rc_type == RCT_MOVE_EDIT ||
+	    rrc->rc_type == RCT_MOVE ||
+	    rrc->rc_type == RCT_MOVE_EDIT) {
+		rebase_record_conflict(&rs->rs_manifest,
+		    RCONF_MOVE_VS_EDIT, lrc->rc_obj,
+		    lrc->rc_path, lrc->rc_pathlen);
+		return (0);
+	}
+
+	return (0);
+}
+
+/*
+ * Find the first entry in an rcl_by_obj tree with the given
+ * object number, or NULL if none exists.
+ */
+static rebase_change_t *
+rebase_find_by_obj(rebase_changelist_t *rcl, uint64_t obj)
+{
+	rebase_change_t search;
+	avl_index_t where;
+	rebase_change_t *rc;
+
+	search.rc_obj = obj;
+	search.rc_path = "";
+
+	rc = avl_find(&rcl->rcl_by_obj, &search, &where);
+	if (rc != NULL)
+		return (rc);
+
+	rc = avl_nearest(&rcl->rcl_by_obj, where, AVL_AFTER);
+	if (rc != NULL && rc->rc_obj == obj)
+		return (rc);
+
+	return (NULL);
+}
+
+/*
+ * Detect move divergence and move-vs-edit conflicts by
+ * cross-referencing object numbers between the two changelists.
+ */
+static void
+rebase_crossref_moves(rebase_state_t *rs)
+{
+	rebase_changelist_t *left = &rs->rs_left_changes;
+	rebase_changelist_t *right = &rs->rs_right_changes;
+	rebase_change_t *lrc, *rrc;
+
+	for (lrc = avl_first(&left->rcl_by_obj); lrc != NULL;
+	    lrc = AVL_NEXT(&left->rcl_by_obj, lrc)) {
+		if (lrc->rc_type != RCT_MOVE &&
+		    lrc->rc_type != RCT_MOVE_EDIT)
+			continue;
+
+		rrc = rebase_find_by_obj(right, lrc->rc_obj);
+		if (rrc == NULL)
+			continue;
+
+		if (rrc->rc_type == RCT_MOVE ||
+		    rrc->rc_type == RCT_MOVE_EDIT) {
+			if (strcmp(lrc->rc_path, rrc->rc_path) != 0) {
+				rebase_record_conflict(&rs->rs_manifest,
+				    RCONF_MOVE_DIVERGE, lrc->rc_obj,
+				    lrc->rc_path, lrc->rc_pathlen);
+			}
+		} else {
+			rebase_record_conflict(&rs->rs_manifest,
+			    RCONF_MOVE_VS_EDIT, lrc->rc_obj,
+			    lrc->rc_path, lrc->rc_pathlen);
+		}
+	}
+
+	/* Check right-side moves against left entries. */
+	for (rrc = avl_first(&right->rcl_by_obj); rrc != NULL;
+	    rrc = AVL_NEXT(&right->rcl_by_obj, rrc)) {
+		if (rrc->rc_type != RCT_MOVE &&
+		    rrc->rc_type != RCT_MOVE_EDIT)
+			continue;
+
+		lrc = rebase_find_by_obj(left, rrc->rc_obj);
+		if (lrc == NULL)
+			continue;
+
+		/*
+		 * Skip pairs where left is also a MOVE — already
+		 * handled above (avoid double-reporting).
+		 */
+		if (lrc->rc_type == RCT_MOVE ||
+		    lrc->rc_type == RCT_MOVE_EDIT)
+			continue;
+
+		rebase_record_conflict(&rs->rs_manifest,
+		    RCONF_MOVE_VS_EDIT, rrc->rc_obj,
+		    rrc->rc_path, rrc->rc_pathlen);
+	}
+}
+
+/*
+ * Detect directory-deletion-vs-edit conflicts. For each directory
+ * DELETE on one side, find entries on the other side whose path
+ * falls inside the deleted directory.  Only flag entries that are
+ * exclusive to the other side (not already matched by the path
+ * merge walk).
+ */
+static void
+rebase_crossref_dir_deletes_one(rebase_manifest_t *rm,
+    rebase_changelist_t *del_side, rebase_changelist_t *other_side)
+{
+	rebase_change_t *rc;
+
+	for (rc = avl_first(&del_side->rcl_by_path); rc != NULL;
+	    rc = AVL_NEXT(&del_side->rcl_by_path, rc)) {
+		size_t dirlen;
+		char *prefix;
+		rebase_change_t search;
+		avl_index_t where;
+		rebase_change_t *orc;
+
+		if (rc->rc_type != RCT_DELETE &&
+		    rc->rc_type != RCT_HARDLINK_DELETE)
+			continue;
+		if (rc->rc_dn_type != DMU_OT_DIRECTORY_CONTENTS)
+			continue;
+
+		/*
+		 * Build the prefix: dir_path + "/".
+		 * Paths inside this directory sort after the
+		 * prefix in strcmp order.
+		 */
+		dirlen = strlen(rc->rc_path);
+		prefix = kmem_alloc(dirlen + 2, KM_SLEEP);
+		memcpy(prefix, rc->rc_path, dirlen);
+		prefix[dirlen] = '/';
+		prefix[dirlen + 1] = '\0';
+
+		/*
+		 * Use AVL lookup to find the first entry in the
+		 * other side's by_path tree >= prefix.
+		 */
+		search.rc_path = prefix;
+		orc = avl_find(&other_side->rcl_by_path,
+		    &search, &where);
+		if (orc == NULL)
+			orc = avl_nearest(&other_side->rcl_by_path,
+			    where, AVL_AFTER);
+
+		while (orc != NULL &&
+		    strncmp(orc->rc_path, prefix, dirlen + 1) == 0) {
+			rebase_change_t psearch;
+			avl_index_t pwhere;
+
+			/*
+			 * Only flag if this path has no matching
+			 * entry on the deleting side — otherwise
+			 * the path merge already caught it.
+			 */
+			psearch.rc_path = orc->rc_path;
+			if (avl_find(&del_side->rcl_by_path,
+			    &psearch, &pwhere) == NULL) {
+				rebase_record_conflict(rm,
+				    RCONF_DIR_DELETE_VS_EDIT,
+				    orc->rc_obj,
+				    orc->rc_path, orc->rc_pathlen);
+			}
+
+			orc = AVL_NEXT(&other_side->rcl_by_path,
+			    orc);
+		}
+
+		kmem_free(prefix, dirlen + 2);
+	}
+}
+
+static void
+rebase_crossref_dir_deletes(rebase_state_t *rs)
+{
+	rebase_crossref_dir_deletes_one(&rs->rs_manifest,
+	    &rs->rs_left_changes, &rs->rs_right_changes);
+	rebase_crossref_dir_deletes_one(&rs->rs_manifest,
+	    &rs->rs_right_changes, &rs->rs_left_changes);
+}
+
+/*
+ * Cross-reference left and right changelists to detect conflicts.
+ * Three passes:
+ *   1. Merge-walk both rcl_by_path trees to find same-path conflicts
+ *   2. Walk by object number to find move divergence/move-vs-edit
+ *   3. Prefix-match directory deletions against the other side
+ */
+static int
+rebase_crossref(rebase_state_t *rs)
+{
+	rebase_changelist_t *left = &rs->rs_left_changes;
+	rebase_changelist_t *right = &rs->rs_right_changes;
+	rebase_change_t *lrc, *rrc;
+	int err;
+
+	/* Pass 1: path-based merge walk. */
+	lrc = avl_first(&left->rcl_by_path);
+	rrc = avl_first(&right->rcl_by_path);
+
+	while (lrc != NULL && rrc != NULL) {
+		int cmp = strcmp(lrc->rc_path, rrc->rc_path);
+
+		if (cmp < 0) {
+			lrc = AVL_NEXT(&left->rcl_by_path, lrc);
+			continue;
+		}
+		if (cmp > 0) {
+			rrc = AVL_NEXT(&right->rcl_by_path, rrc);
+			continue;
+		}
+
+		err = rebase_crossref_samepath(rs, lrc, rrc);
+		if (err != 0)
+			return (err);
+
+		lrc = AVL_NEXT(&left->rcl_by_path, lrc);
+		rrc = AVL_NEXT(&right->rcl_by_path, rrc);
+	}
+
+	/* Pass 2: object-based move conflict detection. */
+	rebase_crossref_moves(rs);
+
+	/* Pass 3: directory deletion prefix matching. */
+	rebase_crossref_dir_deletes(rs);
+
+	return (0);
+}
+
 int
 dsl_rebase(const char *left_ds, const char *right_ds, nvlist_t *outnvl)
 {
@@ -1406,9 +1855,10 @@ dsl_rebase(const char *left_ds, const char *right_ds, nvlist_t *outnvl)
 	if (err != 0)
 		goto rele_base;
 
-	/* Initialize changelists. */
+	/* Initialize changelists and manifest. */
 	rebase_changelist_init(&state.rs_left_changes);
 	rebase_changelist_init(&state.rs_right_changes);
+	rebase_manifest_init(&state.rs_manifest);
 
 	/* Diff phase: populate changelists. */
 	err = rebase_diff(&state);
@@ -1417,15 +1867,19 @@ dsl_rebase(const char *left_ds, const char *right_ds, nvlist_t *outnvl)
 	if (err == 0)
 		err = rebase_collapse(&state);
 
+	/* Cross-reference phase: detect conflicts. */
+	if (err == 0)
+		err = rebase_crossref(&state);
+
 	if (err == 0) {
 		/*
-		 * Changelists collapsed.  Subsequent issues will
-		 * fill in cross-reference, apply, and emit phases
-		 * here.
+		 * Cross-reference complete.  Subsequent issues will
+		 * fill in apply and emit phases here.
 		 */
 		err = SET_ERROR(ENOSYS);
 	}
 
+	rebase_manifest_fini(&state.rs_manifest);
 	rebase_changelist_fini(&state.rs_left_changes);
 	rebase_changelist_fini(&state.rs_right_changes);
 
