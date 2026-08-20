@@ -1400,6 +1400,69 @@ rebase_record_conflict(rebase_manifest_t *rm,
 	rm->rm_nconflicts++;
 }
 
+static const char *
+rebase_conflict_type_name(rebase_conflict_type_t type)
+{
+	switch (type) {
+	case RCONF_BOTH_MODIFIED:	return ("BOTH_MODIFIED");
+	case RCONF_CREATE_CREATE:	return ("CREATE_CREATE");
+	case RCONF_MODIFY_DELETE:	return ("MODIFY_DELETE");
+	case RCONF_DELETE_MODIFY:	return ("DELETE_MODIFY");
+	case RCONF_MOVE_DIVERGE:	return ("MOVE_DIVERGE");
+	case RCONF_MOVE_VS_EDIT:	return ("MOVE_VS_EDIT");
+	case RCONF_DIR_DELETE_VS_EDIT:	return ("DIR_DELETE_VS_EDIT");
+	default:			return ("UNKNOWN");
+	}
+}
+
+/*
+ * Serialize the manifest into an nvlist for the caller.
+ * Emits nconflicts, changelist counts, and per-conflict details.
+ */
+static void
+rebase_manifest_to_nvl(rebase_state_t *rs, nvlist_t *nvl)
+{
+	rebase_manifest_t *rm = &rs->rs_manifest;
+	rebase_conflict_t *rcf;
+	nvlist_t **carr;
+	uint_t i;
+
+	fnvlist_add_uint64(nvl, "nconflicts", rm->rm_nconflicts);
+	fnvlist_add_uint64(nvl, "left_nchanges",
+	    rs->rs_left_changes.rcl_count);
+	fnvlist_add_uint64(nvl, "right_nchanges",
+	    rs->rs_right_changes.rcl_count);
+
+	if (rm->rm_nconflicts == 0)
+		return;
+
+	carr = kmem_alloc(rm->rm_nconflicts * sizeof (nvlist_t *),
+	    KM_SLEEP);
+
+	i = 0;
+	for (rcf = list_head(&rm->rm_conflicts); rcf != NULL;
+	    rcf = list_next(&rm->rm_conflicts, rcf)) {
+		carr[i] = fnvlist_alloc();
+		fnvlist_add_string(carr[i], "type",
+		    rebase_conflict_type_name(rcf->rcf_type));
+		fnvlist_add_string(carr[i], "path", rcf->rcf_path);
+		fnvlist_add_uint64(carr[i], "obj", rcf->rcf_obj);
+		fnvlist_add_uint64(carr[i], "nalt", rcf->rcf_nalt);
+		i++;
+	}
+
+	{
+		const nvlist_t * const *ccarr =
+		    (const nvlist_t * const *)carr;
+		fnvlist_add_nvlist_array(nvl, "conflicts",
+		    ccarr, rm->rm_nconflicts);
+	}
+
+	for (i = 0; i < rm->rm_nconflicts; i++)
+		fnvlist_free(carr[i]);
+	kmem_free(carr, rm->rm_nconflicts * sizeof (nvlist_t *));
+}
+
 /*
  * Classify a conflict for two entries at the same resolved path.
  */
@@ -1753,8 +1816,6 @@ dsl_rebase(const char *left_ds, const char *right_ds, nvlist_t *outnvl)
 	rebase_state_t state;
 	int err;
 
-	(void) outnvl;
-
 	/* Hold the pool from the left dataset name. */
 	err = dsl_pool_hold(left_ds, FTAG, &dp);
 	if (err != 0)
@@ -1873,9 +1934,12 @@ dsl_rebase(const char *left_ds, const char *right_ds, nvlist_t *outnvl)
 
 	if (err == 0) {
 		/*
-		 * Cross-reference complete.  Subsequent issues will
-		 * fill in apply and emit phases here.
+		 * Diff engine complete.  Serialize the manifest so
+		 * the caller can inspect conflicts and changelist
+		 * counts.  The apply phase will land here.
 		 */
+		if (outnvl != NULL)
+			rebase_manifest_to_nvl(&state, outnvl);
 		err = SET_ERROR(ENOSYS);
 	}
 
