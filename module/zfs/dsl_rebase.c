@@ -37,12 +37,16 @@
 #include <sys/dsl_scan.h>
 #include <sys/dmu.h>
 #include <sys/dmu_objset.h>
+#include <sys/dnode.h>
+#include <sys/dbuf.h>
 #include <sys/nvpair.h>
 #include <sys/sa.h>
+#include <sys/spa.h>
 #include <sys/zap.h>
 #include <sys/zfs_acl.h>	/* zfs_sa.h needs zfs_acl_phys_t */
 #include <sys/zfs_sa.h>
 #include <sys/zfs_znode.h>
+#include <sys/zio_checksum.h>
 
 /*
  * Snapshot chain entry for common-ancestor discovery.
@@ -699,19 +703,33 @@ rebase_sa_setup(objset_t *os, sa_attr_type_t **sa_tblp)
 }
 
 /*
- * Per-walk context: the rebase state plus per-branch SA attribute
- * tables and one shared ZAP attribute buffer. Sharing one buffer
- * across recursion levels is safe: each level copies za_name into
- * its own child path before recursing, and ZAP cursors keep their
- * positions independently of the buffer.
+ * Walk slot indices: the fixed order of the three read sources in
+ * every per-slot array (matching the (left, base, right) argument
+ * order used throughout the walk).
+ */
+#define	REBASE_WALK_LEFT	0
+#define	REBASE_WALK_BASE	1
+#define	REBASE_WALK_RIGHT	2
+#define	REBASE_WALK_NSLOTS	3
+
+/*
+ * Per-walk context: the rebase state, per-slot objsets and SA
+ * attribute tables, one shared ZAP attribute buffer, and running
+ * classification counters. Sharing one ZAP buffer across recursion
+ * levels is safe: each level copies za_name into its own child path
+ * before recursing, and ZAP cursors keep their positions
+ * independently of the buffer.
  * Member prefix rwc_ = "rebase walk context".
  */
 typedef struct rebase_walk_ctx {
 	rebase_state_t	*rwc_rs;
-	sa_attr_type_t	*rwc_left_sa;
-	sa_attr_type_t	*rwc_base_sa;
-	sa_attr_type_t	*rwc_right_sa;
+	objset_t	*rwc_os[REBASE_WALK_NSLOTS];
+	sa_attr_type_t	*rwc_sa[REBASE_WALK_NSLOTS];
 	zap_attribute_t	*rwc_za;
+	uint64_t	rwc_nvisited;
+	uint64_t	rwc_nhysterical_left;
+	uint64_t	rwc_nhysterical_right;
+	uint64_t	rwc_nlinked;
 } rebase_walk_ctx_t;
 
 /*
@@ -811,6 +829,23 @@ rebase_linkpool_table_verify(rebase_linkpool_table_t *rlpt)
 }
 
 /*
+ * Linkpool membership lookup by path: an O(log h) find on the
+ * table's by-path reverse index, never a scan. Returns the owning
+ * linkpool, or NULL when the path is not a linkpool member on this
+ * branch.
+ */
+static rebase_linkpool_t *
+rebase_linkpool_of(rebase_linkpool_table_t *rlpt, const char *path)
+{
+	rebase_linkpool_link_t search, *rlpl;
+
+	/* Search key only; the (uintptr_t) hop satisfies -Wcast-qual. */
+	search.rlpl_path = (char *)(uintptr_t)path;
+	rlpl = avl_find(&rlpt->rlpt_by_path, &search, NULL);
+	return (rlpl == NULL ? NULL : rlpl->rlpl_owner);
+}
+
+/*
  * Build a child path by appending "/name" to parent.
  * Returns a kmem_alloc'd string; *lenp receives the allocation
  * size (including the NUL terminator).
@@ -842,23 +877,725 @@ rebase_build_path(const char *parent, size_t parentlen,
 }
 
 /*
+ * Compare one fixed-size (uint64_t) SA attribute across two
+ * handles. The handles may belong to different objsets, so the
+ * attribute id is mapped through each objset's own SA table by the
+ * caller and passed per handle. Both-absent counts as equal;
+ * present-vs-absent counts as different.
+ */
+static int
+rebase_sa_cmp_uint64(sa_handle_t *hdl_a, sa_attr_type_t attr_a,
+    sa_handle_t *hdl_b, sa_attr_type_t attr_b, boolean_t *samep)
+{
+	uint64_t va = 0, vb = 0;
+	int ea, eb;
+
+	*samep = B_FALSE;
+
+	ea = sa_lookup(hdl_a, attr_a, &va, sizeof (va));
+	eb = sa_lookup(hdl_b, attr_b, &vb, sizeof (vb));
+
+	if (ea == ENOENT && eb == ENOENT) {
+		*samep = B_TRUE;
+		return (0);
+	}
+	if (ea != 0 && ea != ENOENT)
+		return (ea);
+	if (eb != 0 && eb != ENOENT)
+		return (eb);
+	if (ea != eb)
+		return (0);
+
+	*samep = (va == vb);
+	return (0);
+}
+
+/*
+ * Compare one variable-length SA attribute across two handles,
+ * with the same per-handle attribute mapping and absence rules as
+ * rebase_sa_cmp_uint64.
+ */
+static int
+rebase_sa_cmp_var(sa_handle_t *hdl_a, sa_attr_type_t attr_a,
+    sa_handle_t *hdl_b, sa_attr_type_t attr_b, boolean_t *samep)
+{
+	void *buf_a, *buf_b;
+	int sz_a, sz_b;
+	int ea, eb, err;
+
+	*samep = B_FALSE;
+
+	ea = sa_size(hdl_a, attr_a, &sz_a);
+	eb = sa_size(hdl_b, attr_b, &sz_b);
+
+	if (ea == ENOENT && eb == ENOENT) {
+		*samep = B_TRUE;
+		return (0);
+	}
+	if (ea != 0 && ea != ENOENT)
+		return (ea);
+	if (eb != 0 && eb != ENOENT)
+		return (eb);
+	if (ea != eb || sz_a != sz_b)
+		return (0);
+	if (sz_a == 0) {
+		*samep = B_TRUE;
+		return (0);
+	}
+
+	buf_a = kmem_alloc(sz_a, KM_SLEEP);
+	buf_b = kmem_alloc(sz_b, KM_SLEEP);
+
+	err = sa_lookup(hdl_a, attr_a, buf_a, sz_a);
+	if (err == 0)
+		err = sa_lookup(hdl_b, attr_b, buf_b, sz_b);
+	if (err == 0)
+		*samep = (memcmp(buf_a, buf_b, sz_a) == 0);
+
+	kmem_free(buf_a, sz_a);
+	kmem_free(buf_b, sz_b);
+	return (err);
+}
+
+/*
+ * SA identity attributes: the fields that constitute what a file
+ * IS, as opposed to bookkeeping about it. Excluded on purpose:
+ * timestamps and ZPL_GEN (rename-on-save always refreshes them, so
+ * including them would make every hysterical edit look real),
+ * ZPL_LINKS and ZPL_PARENT (linkpool-axis bookkeeping, never
+ * content), ZPL_XATTR and ZPL_DXATTR (physical representation;
+ * xattrs are compared logically by rebase_xattr_equal), and
+ * ZPL_SCANSTAMP (a scanner cache, not identity).
+ */
+static const int rebase_identity_fixed[] = {
+	ZPL_MODE, ZPL_UID, ZPL_GID, ZPL_FLAGS,
+	ZPL_RDEV, ZPL_PROJID, ZPL_SIZE, ZPL_DACL_COUNT
+};
+
+static const int rebase_identity_var[] = {
+	ZPL_DACL_ACES, ZPL_SYMLINK
+};
+
+/*
+ * Compare the SA identity of two objects. For directories ZPL_SIZE
+ * is skipped: a directory's size is its entry count, and entry
+ * changes are already fully represented by the child records the
+ * walker emits for every name -- counting them here again would
+ * turn every parent of any change into a spurious edit.
+ */
+static int
+rebase_sa_identity_equal(sa_handle_t *hdl_a,
+    const sa_attr_type_t *tbl_a, sa_handle_t *hdl_b,
+    const sa_attr_type_t *tbl_b, boolean_t isdir, boolean_t *samep)
+{
+	boolean_t same;
+	int err;
+
+	*samep = B_FALSE;
+
+	for (size_t i = 0; i < sizeof (rebase_identity_fixed) /
+	    sizeof (rebase_identity_fixed[0]); i++) {
+		int zpl = rebase_identity_fixed[i];
+
+		if (isdir && zpl == ZPL_SIZE)
+			continue;
+		err = rebase_sa_cmp_uint64(hdl_a, tbl_a[zpl],
+		    hdl_b, tbl_b[zpl], &same);
+		if (err != 0 || !same)
+			return (err);
+	}
+
+	for (size_t i = 0; i < sizeof (rebase_identity_var) /
+	    sizeof (rebase_identity_var[0]); i++) {
+		int zpl = rebase_identity_var[i];
+
+		err = rebase_sa_cmp_var(hdl_a, tbl_a[zpl],
+		    hdl_b, tbl_b[zpl], &same);
+		if (err != 0 || !same)
+			return (err);
+	}
+
+	*samep = B_TRUE;
+	return (0);
+}
+
+/*
+ * Build the logical xattr set of one object as an nvlist of
+ * name -> byte-array pairs, merging both physical representations:
+ * SA-resident (ZPL_DXATTR, itself a packed nvlist of exactly that
+ * shape) and the hidden xattr directory (ZPL_XATTR), whose entries
+ * are plain file objects holding one value each. An object may
+ * legitimately carry both at once -- large values overflow to the
+ * directory even under xattr=sa -- which is why the two forms are
+ * merged instead of chosen between.
+ */
+static int
+rebase_xattr_set(objset_t *os, const sa_attr_type_t *tbl,
+    sa_handle_t *hdl, zap_attribute_t *za, nvlist_t **setp)
+{
+	nvlist_t *set = fnvlist_alloc();
+	uint64_t xattr_obj = 0;
+	int size;
+	int err;
+
+	*setp = NULL;
+
+	/* SA-resident form. */
+	err = sa_size(hdl, tbl[ZPL_DXATTR], &size);
+	if (err == 0 && size > 0) {
+		nvlist_t *dx = NULL;
+		char *packed = vmem_alloc(size, KM_SLEEP);
+
+		err = sa_lookup(hdl, tbl[ZPL_DXATTR], packed, size);
+		if (err == 0 && nvlist_unpack(packed, size, &dx,
+		    KM_SLEEP) != 0) {
+			/*
+			 * An unparseable packed nvlist is corrupt
+			 * on-disk input, not a caller mistake: EIO,
+			 * never the unpacker's EINVAL.
+			 */
+			err = SET_ERROR(EIO);
+		}
+		vmem_free(packed, size);
+		if (err == 0) {
+			fnvlist_merge(set, dx);
+			nvlist_free(dx);
+		}
+	} else if (err == ENOENT) {
+		err = 0;
+	}
+	if (err != 0)
+		goto fail;
+
+	/* Hidden-directory form. */
+	err = sa_lookup(hdl, tbl[ZPL_XATTR], &xattr_obj,
+	    sizeof (xattr_obj));
+	if (err == ENOENT) {
+		err = 0;
+		xattr_obj = 0;
+	}
+	if (err != 0)
+		goto fail;
+
+	if (xattr_obj != 0) {
+		zap_cursor_t zc;
+
+		for (zap_cursor_init(&zc, os, xattr_obj);
+		    (err = zap_cursor_retrieve(&zc, za)) == 0;
+		    zap_cursor_advance(&zc)) {
+			uint64_t xobj =
+			    ZFS_DIRENT_OBJ(za->za_first_integer);
+			sa_handle_t *xhdl;
+			uint64_t xsize;
+			size_t alloc;
+			void *val;
+
+			err = sa_handle_get(os, xobj, NULL,
+			    SA_HDL_PRIVATE, &xhdl);
+			if (err != 0)
+				break;
+			err = sa_lookup(xhdl, tbl[ZPL_SIZE], &xsize,
+			    sizeof (xsize));
+			sa_handle_destroy(xhdl);
+			if (err == ENOENT)
+				err = SET_ERROR(EIO);
+			if (err != 0)
+				break;
+
+			alloc = MAX(xsize, 1);
+			val = vmem_alloc(alloc, KM_SLEEP);
+			if (xsize > 0)
+				err = dmu_read(os, xobj, 0, xsize,
+				    val, DMU_READ_NO_PREFETCH);
+			if (err == 0)
+				fnvlist_add_byte_array(set,
+				    za->za_name, (uchar_t *)val,
+				    (uint_t)xsize);
+			vmem_free(val, alloc);
+			if (err != 0)
+				break;
+		}
+		zap_cursor_fini(&zc);
+		if (err == ENOENT)
+			err = 0;
+		if (err != 0)
+			goto fail;
+	}
+
+	*setp = set;
+	return (0);
+
+fail:
+	nvlist_free(set);
+	return (err);
+}
+
+/*
+ * Compare two logical xattr sets: same names, same values. Order
+ * and physical representation are irrelevant by construction.
+ */
+static boolean_t
+rebase_xattr_set_equal(nvlist_t *a, nvlist_t *b)
+{
+	nvpair_t *pair;
+	uint_t na = 0, nb = 0;
+
+	for (pair = nvlist_next_nvpair(a, NULL); pair != NULL;
+	    pair = nvlist_next_nvpair(a, pair)) {
+		uchar_t *va, *vb;
+		uint_t la, lb;
+
+		na++;
+		if (nvpair_value_byte_array(pair, &va, &la) != 0)
+			return (B_FALSE);
+		if (nvlist_lookup_byte_array(b, nvpair_name(pair),
+		    &vb, &lb) != 0)
+			return (B_FALSE);
+		if (la != lb || memcmp(va, vb, la) != 0)
+			return (B_FALSE);
+	}
+
+	for (pair = nvlist_next_nvpair(b, NULL); pair != NULL;
+	    pair = nvlist_next_nvpair(b, pair))
+		nb++;
+
+	return (na == nb);
+}
+
+/*
+ * Logical xattr comparison, never representational: the same
+ * logical set can live SA-resident on one side and in a hidden
+ * xattr directory on the other (the xattr= property, value sizes,
+ * and write history all move values between forms), so both sides
+ * are unpacked to name -> value sets first. A representation flip
+ * with identical logical content is hysterical.
+ */
+static int
+rebase_xattr_equal(objset_t *os_a, const sa_attr_type_t *tbl_a,
+    sa_handle_t *hdl_a, objset_t *os_b, const sa_attr_type_t *tbl_b,
+    sa_handle_t *hdl_b, zap_attribute_t *za, boolean_t *samep)
+{
+	nvlist_t *set_a, *set_b;
+	int err;
+
+	*samep = B_FALSE;
+
+	err = rebase_xattr_set(os_a, tbl_a, hdl_a, za, &set_a);
+	if (err != 0)
+		return (err);
+	err = rebase_xattr_set(os_b, tbl_b, hdl_b, za, &set_b);
+	if (err != 0) {
+		nvlist_free(set_a);
+		return (err);
+	}
+
+	*samep = rebase_xattr_set_equal(set_a, set_b);
+
+	nvlist_free(set_b);
+	nvlist_free(set_a);
+	return (0);
+}
+
+/*
+ * Recycling guard: the same object number in two objsets is the
+ * same lineage only if ZPL_GEN matches. Object numbers are freed
+ * and reused, and a reused slot is an unrelated file (ADD plus
+ * DELETE), never an edit, no matter what its content says. Like
+ * ZPL_LINKS, a missing ZPL_GEN on a ZPL >= 5 dataset is a hard
+ * error, never a default.
+ */
+static int
+rebase_same_gen(sa_handle_t *hdl_a, const sa_attr_type_t *tbl_a,
+    sa_handle_t *hdl_b, const sa_attr_type_t *tbl_b,
+    boolean_t *samep)
+{
+	uint64_t gen_a, gen_b;
+	int err;
+
+	*samep = B_FALSE;
+
+	err = sa_lookup(hdl_a, tbl_a[ZPL_GEN], &gen_a,
+	    sizeof (gen_a));
+	if (err == 0)
+		err = sa_lookup(hdl_b, tbl_b[ZPL_GEN], &gen_b,
+		    sizeof (gen_b));
+	if (err == ENOENT)
+		return (SET_ERROR(EIO));
+	if (err == 0)
+		*samep = (gen_a == gen_b);
+	return (err);
+}
+
+/*
+ * Fork-txg fast path. An object is untouched since the fork iff
+ * the dnode block holding it has a logical birth txg <=
+ * rs_fork_txg: any change to the object -- data (the dn_blkptr
+ * array is rewritten), spill, bonus/SA, or flags -- rewrites its
+ * dnode, and dmu_diff detects object changes by exactly this
+ * meta-dnode-level pruning against the from-snapshot's
+ * ds_creation_txg. The object's own dn_blkptr birth txgs are
+ * deliberately NOT what is walked here: they never change on a
+ * bonus-only edit (chmod), so walking them would call such an
+ * object untouched. Granularity is the dnode block: a neighboring
+ * object's churn can only force the content tiers to run, never
+ * produce a wrong answer. Both objsets are immutable snapshots
+ * (the fence-post rule), so the block pointer cannot change
+ * beneath the held dnode; anything unavailable degrades to
+ * "touched" and the content tiers decide.
+ */
+static int
+rebase_untouched_since_fork(objset_t *os, uint64_t obj,
+    uint64_t fork_txg, boolean_t *untouchedp)
+{
+	dnode_t *dn;
+	dmu_buf_impl_t *db;
+	int err;
+
+	*untouchedp = B_FALSE;
+
+	err = dnode_hold(os, obj, FTAG, &dn);
+	if (err != 0)
+		return (err);
+
+	db = dn->dn_dbuf;
+	if (db != NULL && db->db_blkptr != NULL &&
+	    !BP_IS_HOLE(db->db_blkptr) &&
+	    BP_GET_LOGICAL_BIRTH(db->db_blkptr) <= fork_txg)
+		*untouchedp = B_TRUE;
+
+	dnode_rele(dn, FTAG);
+	return (0);
+}
+
+/*
+ * Can equal checksums on these two block pointers prove their data
+ * byte-identical? Requires the same algorithm and compression on
+ * both (same physical bytes then imply the same logical bytes),
+ * and an algorithm strong enough that upstream trusts it for
+ * NOP-writes. Fletcher does not qualify: matching fletcher
+ * checksums prove nothing, and with checksum=off two never-
+ * computed checksums compare equal. Either would let a real edit
+ * hide behind a false "identical".
+ */
+static boolean_t
+rebase_bp_cksum_provable(const blkptr_t *bp_a, const blkptr_t *bp_b)
+{
+	uint64_t alg = BP_GET_CHECKSUM(bp_a);
+
+	return (alg == BP_GET_CHECKSUM(bp_b) &&
+	    alg < ZIO_CHECKSUM_FUNCTIONS &&
+	    (zio_checksum_table[alg].ci_flags &
+	    ZCHECKSUM_FLAG_NOPWRITE) != 0 &&
+	    BP_GET_COMPRESS(bp_a) == BP_GET_COMPRESS(bp_b));
+}
+
+/*
+ * Data comparison, tiers 2 and 3. Tier 2 walks the two dnodes'
+ * top-level block pointers and can only ever conclude "same" --
+ * every doubtful pair (hole vs data, embedded vs external, an
+ * unprovable checksum) drops to tier 3, which reads and compares
+ * the logical bytes. Per top-level pair, in order: both holes are
+ * equal; both embedded are equal iff the whole blkptr_t matches
+ * bytewise (the payload lives in the BP words; a differing birth
+ * word makes that inconclusive, not different); BP_EQUAL means the
+ * same physical block, equal with no checksum trust needed (this
+ * is what resolves touch(1)-style bonus churn instantly, since the
+ * rewritten dnode carries its old block pointers verbatim); and
+ * finally a provable checksum pair. Snapshot immutability keeps
+ * dn_phys stable under the dnode hold.
+ */
+static int
+rebase_data_equal(objset_t *os_a, uint64_t obj_a, objset_t *os_b,
+    uint64_t obj_b, uint64_t size, boolean_t *samep)
+{
+	dmu_object_info_t doi_a, doi_b;
+	boolean_t same;
+	int err;
+
+	*samep = B_FALSE;
+
+	if (size == 0) {
+		*samep = B_TRUE;
+		return (0);
+	}
+
+	err = dmu_object_info(os_a, obj_a, &doi_a);
+	if (err == 0)
+		err = dmu_object_info(os_b, obj_b, &doi_b);
+	if (err != 0)
+		return (err);
+
+	/*
+	 * Tier 2 requires congruent block trees; anything else goes
+	 * straight to tier 3.
+	 */
+	if (doi_a.doi_data_block_size == doi_b.doi_data_block_size &&
+	    doi_a.doi_indirection == doi_b.doi_indirection &&
+	    doi_a.doi_nblkptr == doi_b.doi_nblkptr &&
+	    doi_a.doi_max_offset == doi_b.doi_max_offset) {
+		dnode_t *dn_a, *dn_b;
+
+		err = dnode_hold(os_a, obj_a, FTAG, &dn_a);
+		if (err != 0)
+			return (err);
+		err = dnode_hold(os_b, obj_b, FTAG, &dn_b);
+		if (err != 0) {
+			dnode_rele(dn_a, FTAG);
+			return (err);
+		}
+
+		same = B_TRUE;
+		for (int i = 0; i < doi_a.doi_nblkptr; i++) {
+			const blkptr_t *bp_a =
+			    &dn_a->dn_phys->dn_blkptr[i];
+			const blkptr_t *bp_b =
+			    &dn_b->dn_phys->dn_blkptr[i];
+
+			if (BP_IS_HOLE(bp_a) || BP_IS_HOLE(bp_b)) {
+				if (BP_IS_HOLE(bp_a) &&
+				    BP_IS_HOLE(bp_b))
+					continue;
+				same = B_FALSE;
+				break;
+			}
+			if (BP_IS_EMBEDDED(bp_a) ||
+			    BP_IS_EMBEDDED(bp_b)) {
+				if (BP_IS_EMBEDDED(bp_a) &&
+				    BP_IS_EMBEDDED(bp_b) &&
+				    memcmp(bp_a, bp_b,
+				    sizeof (blkptr_t)) == 0)
+					continue;
+				same = B_FALSE;
+				break;
+			}
+			if (BP_EQUAL(bp_a, bp_b))
+				continue;
+			if (rebase_bp_cksum_provable(bp_a, bp_b) &&
+			    ZIO_CHECKSUM_EQUAL(bp_a->blk_cksum,
+			    bp_b->blk_cksum))
+				continue;
+			same = B_FALSE;
+			break;
+		}
+
+		dnode_rele(dn_b, FTAG);
+		dnode_rele(dn_a, FTAG);
+
+		if (same) {
+			*samep = B_TRUE;
+			return (0);
+		}
+	}
+
+	/* Tier 3: byte compare over the logical size. */
+	{
+		size_t bufsz = SPA_OLD_MAXBLOCKSIZE;
+		char *buf_a = vmem_alloc(bufsz, KM_SLEEP);
+		char *buf_b = vmem_alloc(bufsz, KM_SLEEP);
+		uint64_t off = 0;
+
+		same = B_TRUE;
+		while (off < size) {
+			uint64_t chunk = MIN(bufsz, size - off);
+
+			err = dmu_read(os_a, obj_a, off, chunk,
+			    buf_a, DMU_READ_NO_PREFETCH);
+			if (err == 0)
+				err = dmu_read(os_b, obj_b, off,
+				    chunk, buf_b,
+				    DMU_READ_NO_PREFETCH);
+			if (err != 0)
+				break;
+			if (memcmp(buf_a, buf_b, chunk) != 0) {
+				same = B_FALSE;
+				break;
+			}
+			off += chunk;
+		}
+
+		vmem_free(buf_a, bufsz);
+		vmem_free(buf_b, bufsz);
+		if (err == 0)
+			*samep = same;
+	}
+
+	return (err);
+}
+
+/*
+ * Hysteria detection: does the pair (a, b) describe a
+ * transformation where something LOOKS edited but nothing actually
+ * changed? Slot a is base and slot b is a side when base_is_cmp
+ * (the fast path and the recycling guard only make sense against
+ * base); the flag exists because cross-reference will later run
+ * side-vs-side comparisons through the same tiers. Both objects
+ * must exist -- absent-slot cases are ADD/DELETE material and are
+ * classified by standalone-diff, not here.
+ *
+ * Tier order: fork-txg fast path (same object untouched since the
+ * fork is identical, full stop -- one integer compare; this also
+ * subsumes the gen check, since recycling an object number dirties
+ * its dnode block), recycling guard (same object number, touched,
+ * different ZPL_GEN: an unrelated file, never an edit), SA
+ * identity, logical xattrs, and only then file data. Directories
+ * stop after identity and xattrs: a directory's content is its
+ * entries, every entry change is already a child record in its own
+ * right, and independently allocated ZAPs are not comparable
+ * block-wise anyway.
+ */
+static int
+rebase_is_hysterical(rebase_walk_ctx_t *rwc, int slot_a,
+    uint64_t obj_a, int slot_b, uint64_t obj_b,
+    boolean_t base_is_cmp, boolean_t *hystp)
+{
+	objset_t *os_a = rwc->rwc_os[slot_a];
+	objset_t *os_b = rwc->rwc_os[slot_b];
+	const sa_attr_type_t *tbl_a = rwc->rwc_sa[slot_a];
+	const sa_attr_type_t *tbl_b = rwc->rwc_sa[slot_b];
+	dmu_object_info_t doi_a, doi_b;
+	sa_handle_t *hdl_a = NULL, *hdl_b = NULL;
+	boolean_t isdir, same;
+	uint64_t size = 0;
+	int err;
+
+	*hystp = B_FALSE;
+
+	err = dmu_object_info(os_a, obj_a, &doi_a);
+	if (err == 0)
+		err = dmu_object_info(os_b, obj_b, &doi_b);
+	if (err != 0)
+		return (err);
+
+	/*
+	 * A directory vs non-directory flip is always a real
+	 * change. (File vs symlink vs device flips fall out of the
+	 * ZPL_MODE identity compare below.)
+	 */
+	if ((doi_a.doi_type == DMU_OT_DIRECTORY_CONTENTS) !=
+	    (doi_b.doi_type == DMU_OT_DIRECTORY_CONTENTS))
+		return (0);
+	isdir = (doi_a.doi_type == DMU_OT_DIRECTORY_CONTENTS);
+
+	if (base_is_cmp && obj_a == obj_b) {
+		boolean_t untouched;
+
+		err = rebase_untouched_since_fork(os_b, obj_b,
+		    rwc->rwc_rs->rs_fork_txg, &untouched);
+		if (err != 0)
+			return (err);
+		if (untouched) {
+			*hystp = B_TRUE;
+			return (0);
+		}
+	}
+
+	err = sa_handle_get(os_a, obj_a, NULL, SA_HDL_PRIVATE,
+	    &hdl_a);
+	if (err != 0)
+		return (err);
+	err = sa_handle_get(os_b, obj_b, NULL, SA_HDL_PRIVATE,
+	    &hdl_b);
+	if (err != 0) {
+		sa_handle_destroy(hdl_a);
+		return (err);
+	}
+
+	if (base_is_cmp && obj_a == obj_b) {
+		err = rebase_same_gen(hdl_a, tbl_a, hdl_b, tbl_b,
+		    &same);
+		if (err != 0 || !same)
+			goto out;
+	}
+
+	err = rebase_sa_identity_equal(hdl_a, tbl_a, hdl_b, tbl_b,
+	    isdir, &same);
+	if (err != 0 || !same)
+		goto out;
+
+	err = rebase_xattr_equal(os_a, tbl_a, hdl_a, os_b, tbl_b,
+	    hdl_b, rwc->rwc_za, &same);
+	if (err != 0 || !same)
+		goto out;
+
+	if (!isdir) {
+		err = sa_lookup(hdl_b, tbl_b[ZPL_SIZE], &size,
+		    sizeof (size));
+		if (err == ENOENT)
+			err = SET_ERROR(EIO);
+		if (err != 0)
+			goto out;
+	}
+
+	sa_handle_destroy(hdl_b);
+	sa_handle_destroy(hdl_a);
+
+	if (isdir) {
+		*hystp = B_TRUE;
+		return (0);
+	}
+
+	return (rebase_data_equal(os_a, obj_a, os_b, obj_b, size,
+	    hystp));
+
+out:
+	sa_handle_destroy(hdl_b);
+	sa_handle_destroy(hdl_a);
+	return (err);
+}
+
+/*
  * Per-path three-slot diff analysis: the left, base, and right
- * objects visible at one path (0 = absent on that side). This is
- * where hysterical-detect and standalone-diff land; until then
- * every visit is a no-op and the overall operation still exits
- * with ENOSYS.
+ * objects visible at one path (0 = absent on that side). This
+ * issue computes each side's hysteria status against base and the
+ * per-slot linkpool participation; standalone-diff consumes both
+ * to build the two-axis change records. Until it lands the results
+ * are only counted (and reported through dbgmsg at the end of the
+ * walk) so the machinery runs end to end, and the overall
+ * operation still exits with ENOSYS.
  */
 static int
 rebase_walk_diff(rebase_walk_ctx_t *rwc, const char *path,
     size_t pathlen, uint64_t left_obj, uint64_t base_obj,
     uint64_t right_obj)
 {
-	(void) rwc;
-	(void) path;
+	rebase_state_t *rs = rwc->rwc_rs;
+	boolean_t hyst;
+	int err;
+
 	(void) pathlen;
-	(void) left_obj;
-	(void) base_obj;
-	(void) right_obj;
+
+	rwc->rwc_nvisited++;
+
+	if (base_obj != 0 && left_obj != 0) {
+		err = rebase_is_hysterical(rwc, REBASE_WALK_BASE,
+		    base_obj, REBASE_WALK_LEFT, left_obj, B_TRUE,
+		    &hyst);
+		if (err != 0)
+			return (err);
+		if (hyst)
+			rwc->rwc_nhysterical_left++;
+	}
+
+	if (base_obj != 0 && right_obj != 0) {
+		err = rebase_is_hysterical(rwc, REBASE_WALK_BASE,
+		    base_obj, REBASE_WALK_RIGHT, right_obj, B_TRUE,
+		    &hyst);
+		if (err != 0)
+			return (err);
+		if (hyst)
+			rwc->rwc_nhysterical_right++;
+	}
+
+	/*
+	 * Linkpool participation per slot, by path. The walker
+	 * records a path's own membership before calling here, so a
+	 * self-lookup is complete even though the tables are still
+	 * being built.
+	 */
+	if (rebase_linkpool_of(&rs->rs_left_linkpools, path) != NULL ||
+	    rebase_linkpool_of(&rs->rs_base_linkpools, path) != NULL ||
+	    rebase_linkpool_of(&rs->rs_right_linkpools, path) != NULL)
+		rwc->rwc_nlinked++;
 
 	return (0);
 }
@@ -882,31 +1619,23 @@ rebase_walk_visit(rebase_walk_ctx_t *rwc, const char *parent,
     uint64_t base_obj, uint64_t right_obj)
 {
 	rebase_state_t *rs = rwc->rwc_rs;
-	objset_t *oss[3];
-	sa_attr_type_t *tbls[3];
-	rebase_linkpool_table_t *rlpts[3];
-	uint64_t objs[3];
-	boolean_t isdir[3];
+	rebase_linkpool_table_t *rlpts[REBASE_WALK_NSLOTS];
+	uint64_t objs[REBASE_WALK_NSLOTS];
+	boolean_t isdir[REBASE_WALK_NSLOTS];
 	char *cpath;
 	size_t cpathlen;
 	int err = 0;
 
-	oss[0] = rs->rs_left_os;
-	oss[1] = rs->rs_base_os;
-	oss[2] = rs->rs_right_os;
-	tbls[0] = rwc->rwc_left_sa;
-	tbls[1] = rwc->rwc_base_sa;
-	tbls[2] = rwc->rwc_right_sa;
-	rlpts[0] = &rs->rs_left_linkpools;
-	rlpts[1] = &rs->rs_base_linkpools;
-	rlpts[2] = &rs->rs_right_linkpools;
-	objs[0] = left_obj;
-	objs[1] = base_obj;
-	objs[2] = right_obj;
+	rlpts[REBASE_WALK_LEFT] = &rs->rs_left_linkpools;
+	rlpts[REBASE_WALK_BASE] = &rs->rs_base_linkpools;
+	rlpts[REBASE_WALK_RIGHT] = &rs->rs_right_linkpools;
+	objs[REBASE_WALK_LEFT] = left_obj;
+	objs[REBASE_WALK_BASE] = base_obj;
+	objs[REBASE_WALK_RIGHT] = right_obj;
 
 	cpath = rebase_build_path(parent, parentlen, name, &cpathlen);
 
-	for (int i = 0; i < 3; i++) {
+	for (int i = 0; i < REBASE_WALK_NSLOTS; i++) {
 		dmu_object_info_t doi;
 		uint64_t nlink;
 
@@ -914,7 +1643,7 @@ rebase_walk_visit(rebase_walk_ctx_t *rwc, const char *parent,
 		if (objs[i] == 0)
 			continue;
 
-		err = dmu_object_info(oss[i], objs[i], &doi);
+		err = dmu_object_info(rwc->rwc_os[i], objs[i], &doi);
 		if (err != 0)
 			goto out;
 
@@ -923,8 +1652,8 @@ rebase_walk_visit(rebase_walk_ctx_t *rwc, const char *parent,
 			continue;
 		}
 
-		err = rebase_get_nlink(oss[i], tbls[i], objs[i],
-		    &nlink);
+		err = rebase_get_nlink(rwc->rwc_os[i], rwc->rwc_sa[i],
+		    objs[i], &nlink);
 		if (err != 0)
 			goto out;
 		if (nlink > 1)
@@ -1124,13 +1853,20 @@ rebase_walk(rebase_state_t *rs)
 	rebase_walk_ctx_t rwc;
 	int err;
 
+	memset(&rwc, 0, sizeof (rwc));
 	rwc.rwc_rs = rs;
-	err = rebase_sa_setup(rs->rs_left_os, &rwc.rwc_left_sa);
+	rwc.rwc_os[REBASE_WALK_LEFT] = rs->rs_left_os;
+	rwc.rwc_os[REBASE_WALK_BASE] = rs->rs_base_os;
+	rwc.rwc_os[REBASE_WALK_RIGHT] = rs->rs_right_os;
+
+	err = rebase_sa_setup(rs->rs_left_os,
+	    &rwc.rwc_sa[REBASE_WALK_LEFT]);
 	if (err == 0)
-		err = rebase_sa_setup(rs->rs_base_os, &rwc.rwc_base_sa);
+		err = rebase_sa_setup(rs->rs_base_os,
+		    &rwc.rwc_sa[REBASE_WALK_BASE]);
 	if (err == 0)
 		err = rebase_sa_setup(rs->rs_right_os,
-		    &rwc.rwc_right_sa);
+		    &rwc.rwc_sa[REBASE_WALK_RIGHT]);
 	if (err != 0)
 		return (err);
 
@@ -1150,6 +1886,15 @@ rebase_walk(rebase_state_t *rs)
 	if (err == 0)
 		err = rebase_linkpool_table_verify(
 		    &rs->rs_right_linkpools);
+
+	if (err == 0)
+		zfs_dbgmsg("rebase: walk visited %llu paths, "
+		    "hysterical left %llu right %llu, "
+		    "linkpool-member paths %llu",
+		    (u_longlong_t)rwc.rwc_nvisited,
+		    (u_longlong_t)rwc.rwc_nhysterical_left,
+		    (u_longlong_t)rwc.rwc_nhysterical_right,
+		    (u_longlong_t)rwc.rwc_nlinked);
 
 	return (err);
 }
