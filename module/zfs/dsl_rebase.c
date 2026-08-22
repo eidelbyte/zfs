@@ -38,7 +38,10 @@
 #include <sys/dmu.h>
 #include <sys/dmu_objset.h>
 #include <sys/nvpair.h>
+#include <sys/sa.h>
 #include <sys/zap.h>
+#include <sys/zfs_acl.h>	/* zfs_sa.h needs zfs_acl_phys_t */
+#include <sys/zfs_sa.h>
 #include <sys/zfs_znode.h>
 
 /*
@@ -602,6 +605,460 @@ rebase_destroy_snap(const char *snapname, int *errp)
 	}
 }
 
+/*
+ * Set up SA for an objset and return its attribute table. Nothing
+ * has mounted these objsets (base and left are snapshots, right may
+ * be an unmounted head), so the ZPL has not registered the
+ * attribute table for us.
+ */
+static int
+rebase_sa_setup(objset_t *os, sa_attr_type_t **sa_tblp)
+{
+	uint64_t sa_obj = 0;
+	int err;
+
+	err = rebase_master_lookup(os, ZFS_SA_ATTRS, &sa_obj);
+	if (err != 0 && err != ENOENT)
+		return (err);
+
+	return (sa_setup(os, sa_obj, zfs_attr_table, ZPL_END, sa_tblp));
+}
+
+/*
+ * Per-walk context: the rebase state plus per-branch SA attribute
+ * tables and one shared ZAP attribute buffer. Sharing one buffer
+ * across recursion levels is safe: each level copies za_name into
+ * its own child path before recursing, and ZAP cursors keep their
+ * positions independently of the buffer.
+ * Member prefix rwc_ = "rebase walk context".
+ */
+typedef struct rebase_walk_ctx {
+	rebase_state_t	*rwc_rs;
+	sa_attr_type_t	*rwc_left_sa;
+	sa_attr_type_t	*rwc_base_sa;
+	sa_attr_type_t	*rwc_right_sa;
+	zap_attribute_t	*rwc_za;
+} rebase_walk_ctx_t;
+
+/*
+ * Read ZPL_LINKS for one object. Every file on a ZPL >= 5 dataset
+ * carries it (precondition 5); a missing attribute would silently
+ * undermine linkpool discovery, so it is a hard error, never a
+ * default.
+ */
+static int
+rebase_get_nlink(objset_t *os, sa_attr_type_t *sa_tbl, uint64_t obj,
+    uint64_t *nlinkp)
+{
+	sa_handle_t *hdl;
+	int err;
+
+	err = sa_handle_get(os, obj, NULL, SA_HDL_PRIVATE, &hdl);
+	if (err != 0)
+		return (err);
+
+	err = sa_lookup(hdl, sa_tbl[ZPL_LINKS], nlinkp,
+	    sizeof (*nlinkp));
+	sa_handle_destroy(hdl);
+	if (err == ENOENT)
+		err = SET_ERROR(EIO);
+	return (err);
+}
+
+/*
+ * Record one visited path of a hardlinked dnode: upsert the
+ * branch's linkpool (keyed by obj) and append this path as a link,
+ * held in the owner's list and the table-wide by-path reverse
+ * index. A linkpool is discovered at the FIRST link the walk
+ * touches; nothing is ever searched.
+ */
+static void
+rebase_linkpool_note(rebase_linkpool_table_t *rlpt, uint64_t obj,
+    uint64_t nlink, const char *path, size_t pathlen)
+{
+	rebase_linkpool_t search, *rlp;
+	rebase_linkpool_link_t *rlpl;
+	avl_index_t where;
+
+	search.rlp_obj = obj;
+	rlp = avl_find(&rlpt->rlpt_by_obj, &search, &where);
+	if (rlp == NULL) {
+		rlp = kmem_zalloc(sizeof (*rlp), KM_SLEEP);
+		rlp->rlp_obj = obj;
+		rlp->rlp_nlink = nlink;
+		rlp->rlp_state = REBASE_LINKPOOL_UNCLASSIFIED;
+		list_create(&rlp->rlp_links,
+		    sizeof (rebase_linkpool_link_t),
+		    offsetof(rebase_linkpool_link_t, rlpl_node));
+		avl_insert(&rlpt->rlpt_by_obj, rlp, where);
+		rlpt->rlpt_count++;
+	} else {
+		/* Same dnode, same walk: ZPL_LINKS cannot change. */
+		ASSERT3U(rlp->rlp_nlink, ==, nlink);
+	}
+
+	rlpl = kmem_zalloc(sizeof (*rlpl), KM_SLEEP);
+	rlpl->rlpl_pathlen = pathlen;
+	rlpl->rlpl_path = kmem_alloc(pathlen, KM_SLEEP);
+	memcpy(rlpl->rlpl_path, path, pathlen);
+	rlpl->rlpl_owner = rlp;
+	list_insert_tail(&rlp->rlp_links, rlpl);
+	avl_add(&rlpt->rlpt_by_path, rlpl);
+	rlp->rlp_nfound++;
+}
+
+/*
+ * Post-walk integrity check: every link of every linkpool must have
+ * been seen. All links of a file live inside one dataset, and an
+ * unlinked-open file's nlink is already decremented, so
+ * walk-visible nlink always equals visible dir entries. A mismatch
+ * means the linkpool is incomplete and merging with it would be
+ * wrong: VERIFY-grade in debug builds, abort the rebase in
+ * production.
+ */
+static int
+rebase_linkpool_table_verify(rebase_linkpool_table_t *rlpt)
+{
+	for (rebase_linkpool_t *rlp = avl_first(&rlpt->rlpt_by_obj);
+	    rlp != NULL; rlp = AVL_NEXT(&rlpt->rlpt_by_obj, rlp)) {
+		if (rlp->rlp_nfound != rlp->rlp_nlink) {
+			ASSERT3U(rlp->rlp_nfound, ==, rlp->rlp_nlink);
+			return (SET_ERROR(EIO));
+		}
+	}
+	return (0);
+}
+
+/*
+ * Build a child path by appending "/name" to parent.
+ * Returns a kmem_alloc'd string; *lenp receives the allocation
+ * size (including the NUL terminator).
+ */
+static char *
+rebase_build_path(const char *parent, size_t parentlen,
+    const char *name, size_t *lenp)
+{
+	size_t plen = parentlen - 1;
+	size_t nlen = strlen(name);
+	size_t alloc;
+	char *path;
+
+	if (plen == 1 && parent[0] == '/') {
+		alloc = 1 + nlen + 1;
+		path = kmem_alloc(alloc, KM_SLEEP);
+		path[0] = '/';
+		memcpy(path + 1, name, nlen + 1);
+	} else {
+		alloc = plen + 1 + nlen + 1;
+		path = kmem_alloc(alloc, KM_SLEEP);
+		memcpy(path, parent, plen);
+		path[plen] = '/';
+		memcpy(path + plen + 1, name, nlen + 1);
+	}
+
+	*lenp = alloc;
+	return (path);
+}
+
+/*
+ * Per-path three-slot diff analysis: the left, base, and right
+ * objects visible at one path (0 = absent on that side). This is
+ * where hysterical-detect and standalone-diff land; until then
+ * every visit is a no-op and the overall operation still exits
+ * with ENOSYS.
+ */
+static int
+rebase_walk_diff(rebase_walk_ctx_t *rwc, const char *path,
+    size_t pathlen, uint64_t left_obj, uint64_t base_obj,
+    uint64_t right_obj)
+{
+	(void) rwc;
+	(void) path;
+	(void) pathlen;
+	(void) left_obj;
+	(void) base_obj;
+	(void) right_obj;
+
+	return (0);
+}
+
+static int rebase_walk_dir(rebase_walk_ctx_t *rwc, uint64_t left_dir,
+    uint64_t base_dir, uint64_t right_dir, const char *path,
+    size_t pathlen);
+
+/*
+ * Visit one name with its up-to-three objects. Linkpool accounting
+ * runs per branch for every non-directory slot (directories are
+ * never linkpool members: ZPL forbids hardlinked dirs, and a dir's
+ * ZPL_LINKS counts subdir back-references). The slot triple then
+ * goes to walk_diff, and any directory slots are recursed --
+ * including unchanged ones, because a child edit rewrites the
+ * child dnode without touching the parent ZAP.
+ */
+static int
+rebase_walk_visit(rebase_walk_ctx_t *rwc, const char *parent,
+    size_t parentlen, const char *name, uint64_t left_obj,
+    uint64_t base_obj, uint64_t right_obj)
+{
+	rebase_state_t *rs = rwc->rwc_rs;
+	objset_t *oss[3];
+	sa_attr_type_t *tbls[3];
+	rebase_linkpool_table_t *rlpts[3];
+	uint64_t objs[3];
+	boolean_t isdir[3];
+	char *cpath;
+	size_t cpathlen;
+	int err = 0;
+
+	oss[0] = rs->rs_left_os;
+	oss[1] = rs->rs_base_os;
+	oss[2] = rs->rs_right_os;
+	tbls[0] = rwc->rwc_left_sa;
+	tbls[1] = rwc->rwc_base_sa;
+	tbls[2] = rwc->rwc_right_sa;
+	rlpts[0] = &rs->rs_left_linkpools;
+	rlpts[1] = &rs->rs_base_linkpools;
+	rlpts[2] = &rs->rs_right_linkpools;
+	objs[0] = left_obj;
+	objs[1] = base_obj;
+	objs[2] = right_obj;
+
+	cpath = rebase_build_path(parent, parentlen, name, &cpathlen);
+
+	for (int i = 0; i < 3; i++) {
+		dmu_object_info_t doi;
+		uint64_t nlink;
+
+		isdir[i] = B_FALSE;
+		if (objs[i] == 0)
+			continue;
+
+		err = dmu_object_info(oss[i], objs[i], &doi);
+		if (err != 0)
+			goto out;
+
+		if (doi.doi_type == DMU_OT_DIRECTORY_CONTENTS) {
+			isdir[i] = B_TRUE;
+			continue;
+		}
+
+		err = rebase_get_nlink(oss[i], tbls[i], objs[i],
+		    &nlink);
+		if (err != 0)
+			goto out;
+		if (nlink > 1)
+			rebase_linkpool_note(rlpts[i], objs[i], nlink,
+			    cpath, cpathlen);
+	}
+
+	err = rebase_walk_diff(rwc, cpath, cpathlen, left_obj,
+	    base_obj, right_obj);
+	if (err != 0)
+		goto out;
+
+	/*
+	 * Recurse into whichever slots are directories. An absent
+	 * or non-directory slot contributes nothing below this path.
+	 */
+	if (isdir[0] || isdir[1] || isdir[2]) {
+		err = rebase_walk_dir(rwc,
+		    isdir[0] ? objs[0] : 0,
+		    isdir[1] ? objs[1] : 0,
+		    isdir[2] ? objs[2] : 0,
+		    cpath, cpathlen);
+	}
+
+out:
+	kmem_free(cpath, cpathlen);
+	return (err);
+}
+
+/*
+ * Walk one directory level three ways: iterate the union of names,
+ * visiting base's names first (with left and right matched by
+ * lookup), then left's names absent from base, then right's names
+ * absent from both. A dir argument of 0 means that side has no
+ * directory at this path.
+ *
+ * Delete-queue orphans (the ZFS_UNLINKED_SET) are pathless and
+ * carry nlink == 0: a path-driven walk never encounters them and
+ * must not go looking. They cannot skew the linkpool VERIFY,
+ * because queue residency implies the last dir entry is already
+ * gone.
+ */
+static int
+rebase_walk_dir(rebase_walk_ctx_t *rwc, uint64_t left_dir,
+    uint64_t base_dir, uint64_t right_dir, const char *path,
+    size_t pathlen)
+{
+	rebase_state_t *rs = rwc->rwc_rs;
+	zap_attribute_t *za = rwc->rwc_za;
+	zap_cursor_t zc;
+	int err = 0;
+
+	/* Phase 1: every name in base, with left and right matched. */
+	if (base_dir != 0) {
+		for (zap_cursor_init(&zc, rs->rs_base_os, base_dir);
+		    (err = zap_cursor_retrieve(&zc, za)) == 0;
+		    zap_cursor_advance(&zc)) {
+			uint64_t b_obj, l_obj, r_obj, v;
+
+			b_obj = ZFS_DIRENT_OBJ(za->za_first_integer);
+
+			l_obj = 0;
+			if (left_dir != 0) {
+				err = zap_lookup(rs->rs_left_os,
+				    left_dir, za->za_name, 8, 1, &v);
+				if (err == 0)
+					l_obj = ZFS_DIRENT_OBJ(v);
+				else if (err != ENOENT)
+					break;
+			}
+
+			r_obj = 0;
+			if (right_dir != 0) {
+				err = zap_lookup(rs->rs_right_os,
+				    right_dir, za->za_name, 8, 1, &v);
+				if (err == 0)
+					r_obj = ZFS_DIRENT_OBJ(v);
+				else if (err != ENOENT)
+					break;
+			}
+
+			err = rebase_walk_visit(rwc, path, pathlen,
+			    za->za_name, l_obj, b_obj, r_obj);
+			if (err != 0)
+				break;
+		}
+		zap_cursor_fini(&zc);
+		if (err == ENOENT)
+			err = 0;
+		if (err != 0)
+			return (err);
+	}
+
+	/* Phase 2: names only in left. */
+	if (left_dir != 0) {
+		for (zap_cursor_init(&zc, rs->rs_left_os, left_dir);
+		    (err = zap_cursor_retrieve(&zc, za)) == 0;
+		    zap_cursor_advance(&zc)) {
+			uint64_t l_obj, r_obj, v;
+
+			l_obj = ZFS_DIRENT_OBJ(za->za_first_integer);
+
+			if (base_dir != 0) {
+				err = zap_lookup(rs->rs_base_os,
+				    base_dir, za->za_name, 8, 1, &v);
+				if (err == 0)
+					continue; /* phase 1 visited */
+				if (err != ENOENT)
+					break;
+			}
+
+			r_obj = 0;
+			if (right_dir != 0) {
+				err = zap_lookup(rs->rs_right_os,
+				    right_dir, za->za_name, 8, 1, &v);
+				if (err == 0)
+					r_obj = ZFS_DIRENT_OBJ(v);
+				else if (err != ENOENT)
+					break;
+			}
+
+			err = rebase_walk_visit(rwc, path, pathlen,
+			    za->za_name, l_obj, 0, r_obj);
+			if (err != 0)
+				break;
+		}
+		zap_cursor_fini(&zc);
+		if (err == ENOENT)
+			err = 0;
+		if (err != 0)
+			return (err);
+	}
+
+	/* Phase 3: names only in right. */
+	if (right_dir != 0) {
+		for (zap_cursor_init(&zc, rs->rs_right_os, right_dir);
+		    (err = zap_cursor_retrieve(&zc, za)) == 0;
+		    zap_cursor_advance(&zc)) {
+			uint64_t r_obj, v;
+
+			r_obj = ZFS_DIRENT_OBJ(za->za_first_integer);
+
+			if (base_dir != 0) {
+				err = zap_lookup(rs->rs_base_os,
+				    base_dir, za->za_name, 8, 1, &v);
+				if (err == 0)
+					continue; /* phase 1 visited */
+				if (err != ENOENT)
+					break;
+			}
+			if (left_dir != 0) {
+				err = zap_lookup(rs->rs_left_os,
+				    left_dir, za->za_name, 8, 1, &v);
+				if (err == 0)
+					continue; /* phase 2 visited */
+				if (err != ENOENT)
+					break;
+			}
+
+			err = rebase_walk_visit(rwc, path, pathlen,
+			    za->za_name, 0, 0, r_obj);
+			if (err != 0)
+				break;
+		}
+		zap_cursor_fini(&zc);
+		if (err == ENOENT)
+			err = 0;
+		if (err != 0)
+			return (err);
+	}
+
+	return (0);
+}
+
+/*
+ * The walk phase: set up SA on the three read sources, walk the
+ * union of the trees from the roots, and verify linkpool
+ * completeness on all three tables.
+ */
+static int
+rebase_walk(rebase_state_t *rs)
+{
+	rebase_walk_ctx_t rwc;
+	int err;
+
+	rwc.rwc_rs = rs;
+	err = rebase_sa_setup(rs->rs_left_os, &rwc.rwc_left_sa);
+	if (err == 0)
+		err = rebase_sa_setup(rs->rs_base_os, &rwc.rwc_base_sa);
+	if (err == 0)
+		err = rebase_sa_setup(rs->rs_right_os,
+		    &rwc.rwc_right_sa);
+	if (err != 0)
+		return (err);
+
+	rwc.rwc_za = zap_attribute_alloc();
+
+	err = rebase_walk_dir(&rwc, rs->rs_left_root,
+	    rs->rs_base_root, rs->rs_right_root, "/", 2);
+
+	zap_attribute_free(rwc.rwc_za);
+
+	if (err == 0)
+		err = rebase_linkpool_table_verify(
+		    &rs->rs_base_linkpools);
+	if (err == 0)
+		err = rebase_linkpool_table_verify(
+		    &rs->rs_left_linkpools);
+	if (err == 0)
+		err = rebase_linkpool_table_verify(
+		    &rs->rs_right_linkpools);
+
+	return (err);
+}
+
 int
 dsl_rebase(const char *left_ds, const char *right_ds, nvlist_t *outnvl)
 {
@@ -702,11 +1159,17 @@ dsl_rebase(const char *left_ds, const char *right_ds, nvlist_t *outnvl)
 	if (err != 0)
 		goto rele_right_snap;
 
+	/* Walk the trees and build the linkpool tables. */
+	err = rebase_walk(&state);
+
 	/*
-	 * State initialized.  Subsequent issues fill in the diff,
-	 * cross-reference, emit, and apply phases here.
+	 * Walk complete.  Subsequent issues fill in the diff
+	 * classification, cross-reference, emit, and apply phases
+	 * here; until they land, a successful walk still exits
+	 * with ENOSYS.
 	 */
-	err = SET_ERROR(ENOSYS);
+	if (err == 0)
+		err = SET_ERROR(ENOSYS);
 
 	rebase_state_teardown(&state);
 rele_right_snap:
