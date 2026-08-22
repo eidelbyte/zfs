@@ -368,6 +368,7 @@ ZFS_OBJS := \
 	dsl_dir.o \
 	dsl_pool.o \
 	dsl_prop.o \
+	dsl_rebase.o \
 	dsl_scan.o \
 	dsl_synctask.o \
 	dsl_userhold.o \
