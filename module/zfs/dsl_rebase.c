@@ -177,8 +177,12 @@ rebase_change_path_cmp(const void *a, const void *b)
 {
 	const rebase_change_t *la = a;
 	const rebase_change_t *lb = b;
+	int cmp;
 
-	return (strcmp(la->rc_path, lb->rc_path));
+	cmp = strcmp(la->rc_path, lb->rc_path);
+	if (cmp != 0)
+		return (cmp);
+	return (TREE_CMP(la->rc_obj, lb->rc_obj));
 }
 
 static int
@@ -349,6 +353,31 @@ rebase_build_path(const char *parent, size_t parentlen,
 
 	*lenp = alloc;
 	return (path);
+}
+
+/*
+ * Find the first entry in an rcl_by_path tree with the given path
+ * (any obj#), or NULL if no entry at this path exists.
+ */
+static rebase_change_t *
+rebase_find_by_path(rebase_changelist_t *rcl, const char *path)
+{
+	rebase_change_t search;
+	avl_index_t where;
+	rebase_change_t *rc;
+
+	search.rc_path = (char *)path;
+	search.rc_obj = 0;
+
+	rc = avl_find(&rcl->rcl_by_path, &search, &where);
+	if (rc != NULL)
+		return (rc);
+
+	rc = avl_nearest(&rcl->rcl_by_path, where, AVL_AFTER);
+	if (rc != NULL && strcmp(rc->rc_path, path) == 0)
+		return (rc);
+
+	return (NULL);
 }
 
 /*
@@ -1014,6 +1043,7 @@ rebase_diff_dir(objset_t *base_os, objset_t *side_os,
 			    cpath, cpathlen, rcl, za);
 		} else {
 			boolean_t hyst;
+			boolean_t record = B_FALSE;
 
 			err = rebase_is_hysterical(base_os,
 			    base_child, side_os, side_child,
@@ -1023,7 +1053,40 @@ rebase_diff_dir(objset_t *base_os, objset_t *side_os,
 				break;
 			}
 			if (!hyst) {
-				rebase_record_change(rcl, RCT_EDIT,
+				record = B_TRUE;
+			} else {
+				/*
+				 * Content identical despite different
+				 * dnode.  Still record DELETE + ADD if
+				 * the base obj persists in side (link
+				 * breakup — need ref counting in
+				 * collapse).  Suppress only when the
+				 * base obj was freed (nvim/sed -i).
+				 */
+				boolean_t persists;
+
+				err = rebase_same_gen(base_os,
+				    side_os, base_child, &persists);
+				if (err != 0) {
+					kmem_free(cpath, cpathlen);
+					break;
+				}
+				if (persists)
+					record = B_TRUE;
+			}
+			if (record) {
+				dmu_object_info_t base_doi;
+
+				err = dmu_object_info(base_os,
+				    base_child, &base_doi);
+				if (err != 0) {
+					kmem_free(cpath, cpathlen);
+					break;
+				}
+				rebase_record_change(rcl, RCT_DELETE,
+				    base_child, cpath, cpathlen,
+				    base_doi.doi_type);
+				rebase_record_change(rcl, RCT_ADD,
 				    side_child, cpath, cpathlen,
 				    doi.doi_type);
 			}
@@ -1587,6 +1650,31 @@ rebase_crossref_samepath(rebase_state_t *rs,
 		return (0);
 	}
 
+	/*
+	 * ADD vs EDIT (or vice versa) at the same path with different
+	 * dnode object numbers.  One side replaced the file at this
+	 * path; the other edited the original.  Both sides have
+	 * divergent content at this path.
+	 */
+	if ((lrc->rc_type == RCT_ADD ||
+	    lrc->rc_type == RCT_HARDLINK_ADD) &&
+	    (rrc->rc_type == RCT_EDIT ||
+	    rrc->rc_type == RCT_MOVE_EDIT)) {
+		rebase_record_conflict(&rs->rs_manifest,
+		    RCONF_BOTH_MODIFIED, lrc->rc_obj,
+		    lrc->rc_path, lrc->rc_pathlen);
+		return (0);
+	}
+	if ((lrc->rc_type == RCT_EDIT ||
+	    lrc->rc_type == RCT_MOVE_EDIT) &&
+	    (rrc->rc_type == RCT_ADD ||
+	    rrc->rc_type == RCT_HARDLINK_ADD)) {
+		rebase_record_conflict(&rs->rs_manifest,
+		    RCONF_BOTH_MODIFIED, lrc->rc_obj,
+		    lrc->rc_path, lrc->rc_pathlen);
+		return (0);
+	}
+
 	return (0);
 }
 
@@ -1718,6 +1806,7 @@ rebase_crossref_dir_deletes_one(rebase_manifest_t *rm,
 		 * other side's by_path tree >= prefix.
 		 */
 		search.rc_path = prefix;
+		search.rc_obj = 0;
 		orc = avl_find(&other_side->rcl_by_path,
 		    &search, &where);
 		if (orc == NULL)
@@ -1726,17 +1815,13 @@ rebase_crossref_dir_deletes_one(rebase_manifest_t *rm,
 
 		while (orc != NULL &&
 		    strncmp(orc->rc_path, prefix, dirlen + 1) == 0) {
-			rebase_change_t psearch;
-			avl_index_t pwhere;
-
 			/*
 			 * Only flag if this path has no matching
 			 * entry on the deleting side — otherwise
 			 * the path merge already caught it.
 			 */
-			psearch.rc_path = orc->rc_path;
-			if (avl_find(&del_side->rcl_by_path,
-			    &psearch, &pwhere) == NULL) {
+			if (rebase_find_by_path(del_side,
+			    orc->rc_path) == NULL) {
 				rebase_record_conflict(rm,
 				    RCONF_DIR_DELETE_VS_EDIT,
 				    orc->rc_obj,
@@ -1775,7 +1860,19 @@ rebase_crossref(rebase_state_t *rs)
 	rebase_change_t *lrc, *rrc;
 	int err;
 
-	/* Pass 1: path-based merge walk. */
+	/*
+	 * Pass 1: path-based merge walk.
+	 *
+	 * The by_path tree is keyed by (path, obj), so multiple entries
+	 * can exist at the same path (e.g. DELETE of old dnode + ADD of
+	 * new dnode when a file is replaced).  We compare by path only
+	 * and process all same-path entries as a group.
+	 *
+	 * Within a group: first cross-reference entries whose obj#
+	 * matches (same dnode on both sides), then cross-reference
+	 * remaining content-bearing entries across different obj#s
+	 * (path collision between different dnodes).
+	 */
 	lrc = avl_first(&left->rcl_by_path);
 	rrc = avl_first(&right->rcl_by_path);
 
@@ -1783,20 +1880,77 @@ rebase_crossref(rebase_state_t *rs)
 		int cmp = strcmp(lrc->rc_path, rrc->rc_path);
 
 		if (cmp < 0) {
-			lrc = AVL_NEXT(&left->rcl_by_path, lrc);
+			const char *p = lrc->rc_path;
+			while (lrc != NULL &&
+			    strcmp(lrc->rc_path, p) == 0)
+				lrc = AVL_NEXT(&left->rcl_by_path,
+				    lrc);
 			continue;
 		}
 		if (cmp > 0) {
-			rrc = AVL_NEXT(&right->rcl_by_path, rrc);
+			const char *p = rrc->rc_path;
+			while (rrc != NULL &&
+			    strcmp(rrc->rc_path, p) == 0)
+				rrc = AVL_NEXT(&right->rcl_by_path,
+				    rrc);
 			continue;
 		}
 
-		err = rebase_crossref_samepath(rs, lrc, rrc);
-		if (err != 0)
-			return (err);
+		{
+			const char *path = lrc->rc_path;
+			rebase_change_t *lfirst = lrc;
+			rebase_change_t *rfirst = rrc;
+			rebase_change_t *l, *r;
 
-		lrc = AVL_NEXT(&left->rcl_by_path, lrc);
-		rrc = AVL_NEXT(&right->rcl_by_path, rrc);
+			while (lrc != NULL &&
+			    strcmp(lrc->rc_path, path) == 0)
+				lrc = AVL_NEXT(&left->rcl_by_path,
+				    lrc);
+			while (rrc != NULL &&
+			    strcmp(rrc->rc_path, path) == 0)
+				rrc = AVL_NEXT(&right->rcl_by_path,
+				    rrc);
+
+			/* (a) Obj-matched pairs. */
+			for (l = lfirst; l != lrc;
+			    l = AVL_NEXT(&left->rcl_by_path, l)) {
+				for (r = rfirst; r != rrc;
+				    r = AVL_NEXT(&right->rcl_by_path,
+				    r)) {
+					if (l->rc_obj != r->rc_obj)
+						continue;
+					err = rebase_crossref_samepath(
+					    rs, l, r);
+					if (err != 0)
+						return (err);
+				}
+			}
+
+			/*
+			 * (b) Cross-obj pairs where both sides have
+			 *     content at this path (not a DELETE).
+			 */
+			for (l = lfirst; l != lrc;
+			    l = AVL_NEXT(&left->rcl_by_path, l)) {
+				if (l->rc_type == RCT_DELETE ||
+				    l->rc_type == RCT_HARDLINK_DELETE)
+					continue;
+				for (r = rfirst; r != rrc;
+				    r = AVL_NEXT(&right->rcl_by_path,
+				    r)) {
+					if (l->rc_obj == r->rc_obj)
+						continue;
+					if (r->rc_type == RCT_DELETE ||
+					    r->rc_type ==
+					    RCT_HARDLINK_DELETE)
+						continue;
+					err = rebase_crossref_samepath(
+					    rs, l, r);
+					if (err != 0)
+						return (err);
+				}
+			}
+		}
 	}
 
 	/* Pass 2: object-based move conflict detection. */
@@ -2213,14 +2367,8 @@ rebase_apply_additions(rebase_state_t *rs)
 			continue;
 
 		/* Skip if left also changed this path. */
-		{
-			rebase_change_t search;
-			avl_index_t where;
-			search.rc_path = rc->rc_path;
-			if (avl_find(&left->rcl_by_path,
-			    &search, &where) != NULL)
-				continue;
-		}
+		if (rebase_find_by_path(left, rc->rc_path) != NULL)
+			continue;
 
 		err = rebase_resolve_parent(dst_os, rs->rs_left_root,
 		    rc->rc_path, &parent_obj, &name);
@@ -2365,14 +2513,8 @@ rebase_apply_additions(rebase_state_t *rs)
 		if (rc->rc_type != RCT_HARDLINK_ADD)
 			continue;
 
-		{
-			rebase_change_t search;
-			avl_index_t where;
-			search.rc_path = rc->rc_path;
-			if (avl_find(&left->rcl_by_path,
-			    &search, &where) != NULL)
-				continue;
-		}
+		if (rebase_find_by_path(left, rc->rc_path) != NULL)
+			continue;
 
 		err = rebase_resolve_parent(dst_os, rs->rs_left_root,
 		    rc->rc_path, &parent_obj, &name);
