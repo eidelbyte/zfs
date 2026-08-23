@@ -1544,53 +1544,260 @@ out:
 }
 
 /*
+ * Allocate one two-axis change record and index it in both AVL
+ * trees of the side's changelist. The record owns a copy of the
+ * path. rc_xattr_obj and rc_xattr_changed stay zeroed here (the
+ * reserved "none" values): xattr satellite bookkeeping belongs to
+ * the emit and apply issues, which hold the objects anyway.
+ */
+static void
+rebase_change_add(rebase_changelist_t *rcl, const char *path,
+    size_t pathlen, uint64_t obj, uint8_t dn_type,
+    rebase_content_op_t content_op, rebase_linkpool_op_t linkpool_op,
+    uint64_t linkpool_from, uint64_t linkpool_to)
+{
+	rebase_change_t *rc = kmem_zalloc(sizeof (*rc), KM_SLEEP);
+
+	rc->rc_content_op = content_op;
+	rc->rc_linkpool_op = linkpool_op;
+	rc->rc_obj = obj;
+	rc->rc_linkpool_from = linkpool_from;
+	rc->rc_linkpool_to = linkpool_to;
+	rc->rc_dn_type = dn_type;
+	rc->rc_pathlen = pathlen;
+	rc->rc_path = kmem_alloc(pathlen, KM_SLEEP);
+	memcpy(rc->rc_path, path, pathlen);
+
+	avl_add(&rcl->rcl_by_path, rc);
+	avl_add(&rcl->rcl_by_obj, rc);
+	rcl->rcl_count++;
+}
+
+/*
+ * Content axis for one side against base. Path-scoped: a
+ * rename-on-save edit is an EDIT at the path (plus whatever the
+ * linkpool axis says), never a DELETE+ADD split. The hysteria
+ * check squashes spurious EDITs; the branches are explicit so the
+ * hysterical case can never be shadowed by a fall-through (the
+ * old doc's pseudocode had exactly that bug). The hysteria
+ * counters feed the walk-summary dbgmsg line, whose format is a
+ * stable contract with the test harness.
+ */
+static int
+rebase_content_diff(rebase_walk_ctx_t *rwc, int side_slot,
+    uint64_t base_obj, uint64_t side_obj, rebase_content_op_t *opp)
+{
+	boolean_t hyst;
+	int err;
+
+	if (base_obj == 0 && side_obj == 0) {
+		*opp = REBASE_CONTENT_NONE;
+		return (0);
+	}
+	if (base_obj == 0) {
+		*opp = REBASE_CONTENT_ADD;
+		return (0);
+	}
+	if (side_obj == 0) {
+		*opp = REBASE_CONTENT_DELETE;
+		return (0);
+	}
+
+	err = rebase_is_hysterical(rwc, REBASE_WALK_BASE, base_obj,
+	    side_slot, side_obj, B_TRUE, &hyst);
+	if (err != 0)
+		return (err);
+
+	if (hyst) {
+		if (side_slot == REBASE_WALK_LEFT)
+			rwc->rwc_nhysterical_left++;
+		else
+			rwc->rwc_nhysterical_right++;
+		*opp = REBASE_CONTENT_NONE;
+	} else {
+		*opp = REBASE_CONTENT_EDIT;
+	}
+	return (0);
+}
+
+/*
+ * Linkpool axis for one side against base. Linkpool lineage is
+ * decided by object index plus the recycling guard, NEVER by
+ * path-set overlap -- overlap is reserved for novel-vs-novel
+ * matching in cross-reference phase C, the one place with no base
+ * to pivot through. A member path's dnode IS its linkpool's dnode,
+ * so the untouched-since-fork shortcut and the gen guard run on
+ * the visited objects directly. The walker records a path's own
+ * membership before diffing it, so these self-lookups are complete
+ * even though the tables are still being built.
+ */
+static int
+rebase_linkpool_diff(rebase_walk_ctx_t *rwc, int side_slot,
+    const char *path, uint64_t base_obj, uint64_t side_obj,
+    rebase_linkpool_op_t *opp, uint64_t *fromp, uint64_t *top)
+{
+	rebase_state_t *rs = rwc->rwc_rs;
+	rebase_linkpool_table_t *side_rlpt;
+	rebase_linkpool_t *base_lp = NULL, *side_lp = NULL;
+	int err;
+
+	side_rlpt = (side_slot == REBASE_WALK_LEFT) ?
+	    &rs->rs_left_linkpools : &rs->rs_right_linkpools;
+
+	if (base_obj != 0)
+		base_lp = rebase_linkpool_of(&rs->rs_base_linkpools,
+		    path);
+	if (side_obj != 0)
+		side_lp = rebase_linkpool_of(side_rlpt, path);
+
+	*fromp = 0;
+	*top = 0;
+
+	if (base_lp == NULL && side_lp == NULL) {
+		*opp = REBASE_LINKPOOL_NONE;
+		return (0);
+	}
+
+	if (base_lp == NULL) {
+		/*
+		 * The path joined a linkpool on this side. Whether
+		 * that linkpool is anchored or novel is phase A's
+		 * job, not ours.
+		 */
+		*opp = REBASE_LINKPOOL_ADDED;
+		*top = side_lp->rlp_obj;
+		return (0);
+	}
+
+	if (side_lp == NULL) {
+		/*
+		 * The path left its base linkpool: severed to
+		 * standalone, or deleted outright. The content axis
+		 * disambiguates (DELETE vs NONE/EDIT).
+		 */
+		*opp = REBASE_LINKPOOL_REMOVED;
+		*fromp = base_lp->rlp_obj;
+		return (0);
+	}
+
+	if (side_lp->rlp_obj == base_lp->rlp_obj) {
+		boolean_t same;
+
+		err = rebase_untouched_since_fork(
+		    rwc->rwc_os[side_slot], side_obj,
+		    rs->rs_fork_txg, &same);
+		if (err != 0)
+			return (err);
+
+		if (!same) {
+			sa_handle_t *hdl_a, *hdl_b;
+
+			err = sa_handle_get(
+			    rwc->rwc_os[REBASE_WALK_BASE], base_obj,
+			    NULL, SA_HDL_PRIVATE, &hdl_a);
+			if (err != 0)
+				return (err);
+			err = sa_handle_get(rwc->rwc_os[side_slot],
+			    side_obj, NULL, SA_HDL_PRIVATE, &hdl_b);
+			if (err != 0) {
+				sa_handle_destroy(hdl_a);
+				return (err);
+			}
+			err = rebase_same_gen(hdl_a,
+			    rwc->rwc_sa[REBASE_WALK_BASE], hdl_b,
+			    rwc->rwc_sa[side_slot], &same);
+			sa_handle_destroy(hdl_b);
+			sa_handle_destroy(hdl_a);
+			if (err != 0)
+				return (err);
+		}
+
+		if (same) {
+			*opp = REBASE_LINKPOOL_NONE;
+			return (0);
+		}
+	}
+
+	/*
+	 * A different linkpool, or a recycled index: the path moved
+	 * linkpools. The from/to pair is the split and merge
+	 * provenance phase A reads back mechanically.
+	 */
+	*opp = REBASE_LINKPOOL_MOVED;
+	*fromp = base_lp->rlp_obj;
+	*top = side_lp->rlp_obj;
+	return (0);
+}
+
+/*
  * Per-path three-slot diff analysis: the left, base, and right
- * objects visible at one path (0 = absent on that side). This
- * issue computes each side's hysteria status against base and the
- * per-slot linkpool participation; standalone-diff consumes both
- * to build the two-axis change records. Until it lands the results
- * are only counted (and reported through dbgmsg at the end of the
- * walk) so the machinery runs end to end, and the overall
- * operation still exits with ENOSYS.
+ * objects visible at one path (0 = absent on that side). Each side
+ * gets two independent classifications against base -- content and
+ * linkpool -- and any result with either axis non-NONE becomes one
+ * two-axis record in that side's changelist. Linkpool-only records
+ * (content NONE, linkpool op set) are first-class: their absence
+ * was the root cause of the sprint-1 hardlink bugs. The overall
+ * operation still exits with ENOSYS; move-collapse and
+ * cross-reference consume the changelists next.
  */
 static int
 rebase_walk_diff(rebase_walk_ctx_t *rwc, const char *path,
     size_t pathlen, uint64_t left_obj, uint64_t base_obj,
-    uint64_t right_obj)
+    uint64_t right_obj, const uint8_t *dn_types)
 {
+	static const int sides[2] = {
+		REBASE_WALK_LEFT, REBASE_WALK_RIGHT
+	};
 	rebase_state_t *rs = rwc->rwc_rs;
-	boolean_t hyst;
 	int err;
-
-	(void) pathlen;
 
 	rwc->rwc_nvisited++;
 
-	if (base_obj != 0 && left_obj != 0) {
-		err = rebase_is_hysterical(rwc, REBASE_WALK_BASE,
-		    base_obj, REBASE_WALK_LEFT, left_obj, B_TRUE,
-		    &hyst);
-		if (err != 0)
-			return (err);
-		if (hyst)
-			rwc->rwc_nhysterical_left++;
-	}
+	for (int i = 0; i < 2; i++) {
+		int side = sides[i];
+		uint64_t side_obj = (side == REBASE_WALK_LEFT) ?
+		    left_obj : right_obj;
+		rebase_changelist_t *rcl =
+		    (side == REBASE_WALK_LEFT) ?
+		    &rs->rs_left_changes : &rs->rs_right_changes;
+		rebase_content_op_t content_op;
+		rebase_linkpool_op_t linkpool_op;
+		uint64_t lp_from, lp_to;
 
-	if (base_obj != 0 && right_obj != 0) {
-		err = rebase_is_hysterical(rwc, REBASE_WALK_BASE,
-		    base_obj, REBASE_WALK_RIGHT, right_obj, B_TRUE,
-		    &hyst);
+		if (base_obj == 0 && side_obj == 0)
+			continue;	/* this side never saw it */
+
+		err = rebase_content_diff(rwc, side, base_obj,
+		    side_obj, &content_op);
 		if (err != 0)
 			return (err);
-		if (hyst)
-			rwc->rwc_nhysterical_right++;
+
+		err = rebase_linkpool_diff(rwc, side, path, base_obj,
+		    side_obj, &linkpool_op, &lp_from, &lp_to);
+		if (err != 0)
+			return (err);
+
+		if (content_op == REBASE_CONTENT_NONE &&
+		    linkpool_op == REBASE_LINKPOOL_NONE)
+			continue;
+
+		/*
+		 * The record is about the side's dnode when the side
+		 * has one (ADD, EDIT), and base's when it does not
+		 * (DELETE) -- which is what lets move-collapse match
+		 * a rename's ADD and DELETE by object number.
+		 */
+		rebase_change_add(rcl, path, pathlen,
+		    side_obj != 0 ? side_obj : base_obj,
+		    side_obj != 0 ? dn_types[side] :
+		    dn_types[REBASE_WALK_BASE],
+		    content_op, linkpool_op, lp_from, lp_to);
 	}
 
 	/*
-	 * Linkpool participation per slot, by path. The walker
-	 * records a path's own membership before calling here, so a
-	 * self-lookup is complete even though the tables are still
-	 * being built.
+	 * Walk-summary counter: paths that are linkpool members on
+	 * any branch. Kept alongside the changelists because the
+	 * dbgmsg line it feeds is a stable harness contract.
 	 */
 	if (rebase_linkpool_of(&rs->rs_left_linkpools, path) != NULL ||
 	    rebase_linkpool_of(&rs->rs_base_linkpools, path) != NULL ||
@@ -1622,6 +1829,7 @@ rebase_walk_visit(rebase_walk_ctx_t *rwc, const char *parent,
 	rebase_linkpool_table_t *rlpts[REBASE_WALK_NSLOTS];
 	uint64_t objs[REBASE_WALK_NSLOTS];
 	boolean_t isdir[REBASE_WALK_NSLOTS];
+	uint8_t dn_types[REBASE_WALK_NSLOTS] = { 0 };
 	char *cpath;
 	size_t cpathlen;
 	int err = 0;
@@ -1647,6 +1855,7 @@ rebase_walk_visit(rebase_walk_ctx_t *rwc, const char *parent,
 		if (err != 0)
 			goto out;
 
+		dn_types[i] = (uint8_t)doi.doi_type;
 		if (doi.doi_type == DMU_OT_DIRECTORY_CONTENTS) {
 			isdir[i] = B_TRUE;
 			continue;
@@ -1662,7 +1871,7 @@ rebase_walk_visit(rebase_walk_ctx_t *rwc, const char *parent,
 	}
 
 	err = rebase_walk_diff(rwc, cpath, cpathlen, left_obj,
-	    base_obj, right_obj);
+	    base_obj, right_obj, dn_types);
 	if (err != 0)
 		goto out;
 
@@ -1887,7 +2096,7 @@ rebase_walk(rebase_state_t *rs)
 		err = rebase_linkpool_table_verify(
 		    &rs->rs_right_linkpools);
 
-	if (err == 0)
+	if (err == 0) {
 		zfs_dbgmsg("rebase: walk visited %llu paths, "
 		    "hysterical left %llu right %llu, "
 		    "linkpool-member paths %llu",
@@ -1895,6 +2104,10 @@ rebase_walk(rebase_state_t *rs)
 		    (u_longlong_t)rwc.rwc_nhysterical_left,
 		    (u_longlong_t)rwc.rwc_nhysterical_right,
 		    (u_longlong_t)rwc.rwc_nlinked);
+		zfs_dbgmsg("rebase: changelists left %u right %u",
+		    rs->rs_left_changes.rcl_count,
+		    rs->rs_right_changes.rcl_count);
+	}
 
 	return (err);
 }
