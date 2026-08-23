@@ -244,6 +244,31 @@ rebase_ppath_cmp(const void *a, const void *b)
 	return (TREE_ISIGN(strcmp(la->rpp_path, lb->rpp_path)));
 }
 
+/*
+ * Comparator for the final linkpool groups: the identity is the
+ * full target triple. Kind is compared first -- a recycled branch
+ * pool's raw novel id can numerically equal an anchored base
+ * lineage, and those are different groups.
+ */
+static int
+rebase_group_cmp(const void *a, const void *b)
+{
+	const rebase_linkpool_group_t *ga = a;
+	const rebase_linkpool_group_t *gb = b;
+	int cmp;
+
+	cmp = TREE_CMP(ga->rlpg_target.rmt_kind,
+	    gb->rlpg_target.rmt_kind);
+	if (cmp != 0)
+		return (cmp);
+	cmp = TREE_CMP(ga->rlpg_target.rmt_linkpool,
+	    gb->rlpg_target.rmt_linkpool);
+	if (cmp != 0)
+		return (cmp);
+	return (TREE_CMP(ga->rlpg_target.rmt_fragment,
+	    gb->rlpg_target.rmt_fragment));
+}
+
 static int rebase_sa_setup(objset_t *os, sa_attr_type_t **sa_tblp);
 static void rebase_manifest_init(rebase_manifest_t *rm);
 static void rebase_manifest_fini(rebase_manifest_t *rm);
@@ -682,6 +707,10 @@ rebase_state_setup(rebase_state_t *rs, objset_t *left_snap_os,
 	    sizeof (rebase_ppath_t), offsetof(rebase_ppath_t,
 	    rpp_avl));
 	rs->rs_ppath_count = 0;
+	avl_create(&rs->rs_groups, rebase_group_cmp,
+	    sizeof (rebase_linkpool_group_t),
+	    offsetof(rebase_linkpool_group_t, rlpg_avl));
+	rs->rs_group_count = 0;
 	rebase_manifest_init(&rs->rs_manifest);
 
 	return (0);
@@ -691,8 +720,21 @@ static void
 rebase_state_teardown(rebase_state_t *rs)
 {
 	rebase_ppath_t *rpp;
+	rebase_linkpool_group_t *rlpg;
 	void *cookie = NULL;
 
+	while ((rlpg = avl_destroy_nodes(&rs->rs_groups,
+	    &cookie)) != NULL) {
+		/* Members are rs_ppaths rows; detach, never free. */
+		while (list_remove_head(&rlpg->rlpg_members) != NULL)
+			continue;
+		list_destroy(&rlpg->rlpg_members);
+		kmem_free(rlpg, sizeof (*rlpg));
+	}
+	avl_destroy(&rs->rs_groups);
+	rs->rs_group_count = 0;
+
+	cookie = NULL;
 	while ((rpp = avl_destroy_nodes(&rs->rs_ppaths,
 	    &cookie)) != NULL) {
 		kmem_free(rpp->rpp_path, rpp->rpp_pathlen);
@@ -3854,6 +3896,1112 @@ rebase_membership_merge(rebase_state_t *rs)
 	return (0);
 }
 
+/*
+ * First record in a changelist with the given object number, or
+ * NULL: a zero-length-path probe into the (obj, path) index and
+ * the successor check.
+ */
+static rebase_change_t *
+rebase_change_first_obj(rebase_changelist_t *rcl, uint64_t obj)
+{
+	rebase_change_t key, *rc;
+	avl_index_t where;
+
+	key.rc_obj = obj;
+	key.rc_path = (char *)(uintptr_t)"";
+
+	rc = avl_find(&rcl->rcl_by_obj, &key, &where);
+	if (rc == NULL)
+		rc = avl_nearest(&rcl->rcl_by_obj, where, AVL_AFTER);
+	if (rc != NULL && rc->rc_obj != obj)
+		rc = NULL;
+	return (rc);
+}
+
+/*
+ * Look one branch linkpool up by its dnode object number.
+ */
+static rebase_linkpool_t *
+rebase_linkpool_first_obj(rebase_linkpool_table_t *rlpt, uint64_t obj)
+{
+	rebase_linkpool_t key;
+
+	key.rlp_obj = obj;
+	return (avl_find(&rlpt->rlpt_by_obj, &key, NULL));
+}
+
+/*
+ * A path is standalone when no branch has it as a linkpool member:
+ * such paths never enter the membership machinery and are owned by
+ * the carried-over samepath logic below.
+ */
+static boolean_t
+rebase_path_standalone(rebase_state_t *rs, const char *path)
+{
+	return (rebase_linkpool_of(&rs->rs_left_linkpools,
+	    path) == NULL &&
+	    rebase_linkpool_of(&rs->rs_base_linkpools, path) == NULL &&
+	    rebase_linkpool_of(&rs->rs_right_linkpools,
+	    path) == NULL);
+}
+
+/*
+ * Is this path -- or this object -- already the subject of a
+ * recorded conflict? The object match matters for moves: a
+ * MOVE_VS_EDIT is recorded at the move's destination, but the
+ * other side's record for the same dnode sits at the OLD path,
+ * and replaying it as an action would race the unresolved
+ * conflict.
+ */
+static boolean_t
+rebase_conflict_covers(rebase_manifest_t *rm, const char *path,
+    uint64_t obj)
+{
+	rebase_conflict_t *rcf;
+
+	for (rcf = list_head(&rm->rm_conflicts); rcf != NULL;
+	    rcf = list_next(&rm->rm_conflicts, rcf)) {
+		if (obj != 0 && rcf->rcf_obj == obj)
+			return (B_TRUE);
+		if (strcmp(rcf->rcf_path, path) == 0)
+			return (B_TRUE);
+		for (uint_t i = 0; i < rcf->rcf_nalt; i++) {
+			if (strcmp(rcf->rcf_alt_paths[i], path) == 0)
+				return (B_TRUE);
+		}
+	}
+	return (B_FALSE);
+}
+
+static void
+rebase_warning_add(rebase_state_t *rs, rebase_warning_kind_t kind,
+    uint64_t obj, const char *path, size_t pathlen)
+{
+	rebase_manifest_t *rm = &rs->rs_manifest;
+	rebase_warning_t *rw;
+
+	rw = kmem_zalloc(sizeof (*rw), KM_SLEEP);
+	rw->rw_kind = kind;
+	rw->rw_obj = obj;
+	rw->rw_path = kmem_alloc(pathlen, KM_SLEEP);
+	memcpy(rw->rw_path, path, pathlen);
+	rw->rw_pathlen = pathlen;
+	list_insert_tail(&rm->rm_warnings, rw);
+	rm->rm_nwarnings++;
+}
+
+static void
+rebase_action_add(rebase_state_t *rs, rebase_action_type_t type,
+    const char *path, size_t pathlen, uint64_t obj,
+    rebase_content_src_t src, uint64_t src_obj)
+{
+	rebase_manifest_t *rm = &rs->rs_manifest;
+	rebase_action_t *ra;
+
+	ra = kmem_zalloc(sizeof (*ra), KM_SLEEP);
+	ra->ra_type = type;
+	ra->ra_path = kmem_alloc(pathlen, KM_SLEEP);
+	memcpy(ra->ra_path, path, pathlen);
+	ra->ra_pathlen = pathlen;
+	ra->ra_obj = obj;
+	ra->ra_src = src;
+	ra->ra_src_obj = src_obj;
+	list_insert_tail(&rm->rm_actions, ra);
+	rm->rm_nactions++;
+}
+
+/*
+ * Classify one (left record, right record) pair at the same
+ * standalone path -- the samepath logic carried from the first
+ * engine, minus the hardlink cases the linkpool axis now owns.
+ * Identical changes suppress: both sides editing (or creating) to
+ * the same logical content is convergence, not a conflict --
+ * side-vs-side adjacency through the hysteria tiers, the use the
+ * base_is_cmp flag was built for. The EDIT family is checked
+ * before the MOVE family, so MOVE_EDIT meeting any edit resolves
+ * on content, and only pure-MOVE pairings reach the move branches.
+ */
+static int
+rebase_samepath_pair(rebase_state_t *rs, rebase_walk_ctx_t *rwc,
+    rebase_change_t *lrc, rebase_change_t *rrc)
+{
+	boolean_t same;
+	int err;
+
+	/* Both edited: convergent or BOTH_MODIFIED. */
+	if ((lrc->rc_content_op == REBASE_CONTENT_EDIT ||
+	    lrc->rc_content_op == REBASE_CONTENT_MOVE_EDIT) &&
+	    (rrc->rc_content_op == REBASE_CONTENT_EDIT ||
+	    rrc->rc_content_op == REBASE_CONTENT_MOVE_EDIT)) {
+		err = rebase_is_hysterical(rwc, REBASE_WALK_LEFT,
+		    lrc->rc_obj, REBASE_WALK_RIGHT, rrc->rc_obj,
+		    B_FALSE, &same);
+		if (err != 0)
+			return (err);
+		if (!same) {
+			rebase_conflict_add(rs,
+			    REBASE_CONFLICT_BOTH_MODIFIED,
+			    lrc->rc_obj, lrc->rc_path,
+			    lrc->rc_pathlen);
+		}
+		return (0);
+	}
+
+	/* Both created: convergent or CREATE_CREATE. */
+	if (lrc->rc_content_op == REBASE_CONTENT_ADD &&
+	    rrc->rc_content_op == REBASE_CONTENT_ADD) {
+		err = rebase_is_hysterical(rwc, REBASE_WALK_LEFT,
+		    lrc->rc_obj, REBASE_WALK_RIGHT, rrc->rc_obj,
+		    B_FALSE, &same);
+		if (err != 0)
+			return (err);
+		if (!same) {
+			rebase_conflict_add(rs,
+			    REBASE_CONFLICT_CREATE_CREATE,
+			    lrc->rc_obj, lrc->rc_path,
+			    lrc->rc_pathlen);
+		}
+		return (0);
+	}
+
+	if ((lrc->rc_content_op == REBASE_CONTENT_EDIT ||
+	    lrc->rc_content_op == REBASE_CONTENT_MOVE_EDIT) &&
+	    rrc->rc_content_op == REBASE_CONTENT_DELETE) {
+		rebase_conflict_add(rs,
+		    REBASE_CONFLICT_MODIFY_DELETE, lrc->rc_obj,
+		    lrc->rc_path, lrc->rc_pathlen);
+		return (0);
+	}
+
+	if (lrc->rc_content_op == REBASE_CONTENT_DELETE &&
+	    (rrc->rc_content_op == REBASE_CONTENT_EDIT ||
+	    rrc->rc_content_op == REBASE_CONTENT_MOVE_EDIT)) {
+		rebase_conflict_add(rs,
+		    REBASE_CONFLICT_DELETE_MODIFY, rrc->rc_obj,
+		    rrc->rc_path, rrc->rc_pathlen);
+		return (0);
+	}
+
+	/* Both deleted: agreement. */
+	if (lrc->rc_content_op == REBASE_CONTENT_DELETE &&
+	    rrc->rc_content_op == REBASE_CONTENT_DELETE)
+		return (0);
+
+	/* Both moved something to this path. */
+	if ((lrc->rc_content_op == REBASE_CONTENT_MOVE ||
+	    lrc->rc_content_op == REBASE_CONTENT_MOVE_EDIT) &&
+	    (rrc->rc_content_op == REBASE_CONTENT_MOVE ||
+	    rrc->rc_content_op == REBASE_CONTENT_MOVE_EDIT)) {
+		if (lrc->rc_obj != rrc->rc_obj) {
+			rebase_conflict_add(rs,
+			    REBASE_CONFLICT_MOVE_DIVERGE,
+			    lrc->rc_obj, lrc->rc_path,
+			    lrc->rc_pathlen);
+		}
+		return (0);
+	}
+
+	/*
+	 * A MOVE destination collides with the other side's own
+	 * change at this path.
+	 */
+	if (lrc->rc_content_op == REBASE_CONTENT_MOVE ||
+	    lrc->rc_content_op == REBASE_CONTENT_MOVE_EDIT ||
+	    rrc->rc_content_op == REBASE_CONTENT_MOVE ||
+	    rrc->rc_content_op == REBASE_CONTENT_MOVE_EDIT) {
+		rebase_conflict_add(rs, REBASE_CONFLICT_MOVE_VS_EDIT,
+		    lrc->rc_obj, lrc->rc_path, lrc->rc_pathlen);
+		return (0);
+	}
+
+	/*
+	 * ADD against EDIT across different objects: one side
+	 * replaced the file at this path, the other edited the
+	 * original -- divergent content either way.
+	 */
+	if ((lrc->rc_content_op == REBASE_CONTENT_ADD &&
+	    (rrc->rc_content_op == REBASE_CONTENT_EDIT ||
+	    rrc->rc_content_op == REBASE_CONTENT_MOVE_EDIT)) ||
+	    ((lrc->rc_content_op == REBASE_CONTENT_EDIT ||
+	    lrc->rc_content_op == REBASE_CONTENT_MOVE_EDIT) &&
+	    rrc->rc_content_op == REBASE_CONTENT_ADD)) {
+		rebase_conflict_add(rs,
+		    REBASE_CONFLICT_BOTH_MODIFIED, lrc->rc_obj,
+		    lrc->rc_path, lrc->rc_pathlen);
+		return (0);
+	}
+
+	return (0);
+}
+
+/*
+ * Pass 2 of the standalone cross-reference: move conflicts by
+ * object number. A collapsed MOVE leaves no record at its old
+ * path, but its rc_obj is the moved dnode, and the other side's
+ * records for that dnode (an in-place EDIT, or the DELETE of the
+ * old path) carry the same number -- exactly what the rename's
+ * ADD and DELETE matched by in move-collapse.
+ */
+static void
+rebase_crossref_moves(rebase_state_t *rs)
+{
+	rebase_changelist_t *left = &rs->rs_left_changes;
+	rebase_changelist_t *right = &rs->rs_right_changes;
+	rebase_change_t *lrc, *rrc;
+
+	for (lrc = avl_first(&left->rcl_by_obj); lrc != NULL;
+	    lrc = AVL_NEXT(&left->rcl_by_obj, lrc)) {
+		if (lrc->rc_content_op != REBASE_CONTENT_MOVE &&
+		    lrc->rc_content_op != REBASE_CONTENT_MOVE_EDIT)
+			continue;
+		if (!rebase_path_standalone(rs, lrc->rc_path))
+			continue;
+
+		rrc = rebase_change_first_obj(right, lrc->rc_obj);
+		if (rrc == NULL ||
+		    !rebase_path_standalone(rs, rrc->rc_path))
+			continue;
+
+		if (rrc->rc_content_op == REBASE_CONTENT_MOVE ||
+		    rrc->rc_content_op == REBASE_CONTENT_MOVE_EDIT) {
+			if (strcmp(lrc->rc_path, rrc->rc_path) != 0) {
+				rebase_conflict_add(rs,
+				    REBASE_CONFLICT_MOVE_DIVERGE,
+				    lrc->rc_obj, lrc->rc_path,
+				    lrc->rc_pathlen);
+			}
+		} else {
+			rebase_conflict_add(rs,
+			    REBASE_CONFLICT_MOVE_VS_EDIT,
+			    lrc->rc_obj, lrc->rc_path,
+			    lrc->rc_pathlen);
+		}
+	}
+
+	for (rrc = avl_first(&right->rcl_by_obj); rrc != NULL;
+	    rrc = AVL_NEXT(&right->rcl_by_obj, rrc)) {
+		if (rrc->rc_content_op != REBASE_CONTENT_MOVE &&
+		    rrc->rc_content_op != REBASE_CONTENT_MOVE_EDIT)
+			continue;
+		if (!rebase_path_standalone(rs, rrc->rc_path))
+			continue;
+
+		lrc = rebase_change_first_obj(left, rrc->rc_obj);
+		if (lrc == NULL ||
+		    !rebase_path_standalone(rs, lrc->rc_path))
+			continue;
+
+		/* Left-is-also-a-MOVE pairs were handled above. */
+		if (lrc->rc_content_op == REBASE_CONTENT_MOVE ||
+		    lrc->rc_content_op == REBASE_CONTENT_MOVE_EDIT)
+			continue;
+
+		rebase_conflict_add(rs, REBASE_CONFLICT_MOVE_VS_EDIT,
+		    rrc->rc_obj, rrc->rc_path, rrc->rc_pathlen);
+	}
+}
+
+/*
+ * Pass 3: a directory deleted on one side against entries the
+ * other side added or changed inside it. Paths inside the deleted
+ * directory sort directly after "dir/" in the by_path tree, so one
+ * nearest-lookup plus a prefix scan per deleted directory finds
+ * them all. Only entries with no matching record on the deleting
+ * side are flagged (the samepath pass already handled the rest),
+ * and only standalone ones (a pool member's fate is the membership
+ * machinery's).
+ */
+static void
+rebase_crossref_dir_deletes_one(rebase_state_t *rs,
+    rebase_changelist_t *del_side, rebase_changelist_t *other_side)
+{
+	rebase_change_t *rc;
+
+	for (rc = avl_first(&del_side->rcl_by_path); rc != NULL;
+	    rc = AVL_NEXT(&del_side->rcl_by_path, rc)) {
+		rebase_change_t search, *orc;
+		avl_index_t where;
+		size_t dirlen;
+		char *prefix;
+
+		if (rc->rc_content_op != REBASE_CONTENT_DELETE)
+			continue;
+		if (rc->rc_dn_type != DMU_OT_DIRECTORY_CONTENTS)
+			continue;
+
+		dirlen = strlen(rc->rc_path);
+		prefix = kmem_alloc(dirlen + 2, KM_SLEEP);
+		memcpy(prefix, rc->rc_path, dirlen);
+		prefix[dirlen] = '/';
+		prefix[dirlen + 1] = '\0';
+
+		search.rc_path = prefix;
+		search.rc_obj = 0;
+		orc = avl_find(&other_side->rcl_by_path, &search,
+		    &where);
+		if (orc == NULL)
+			orc = avl_nearest(&other_side->rcl_by_path,
+			    where, AVL_AFTER);
+
+		while (orc != NULL && strncmp(orc->rc_path, prefix,
+		    dirlen + 1) == 0) {
+			if (rebase_change_at(del_side,
+			    orc->rc_path) == NULL &&
+			    rebase_path_standalone(rs,
+			    orc->rc_path)) {
+				rebase_conflict_add(rs,
+				    REBASE_CONFLICT_DIR_DELETE_VS_EDIT,
+				    orc->rc_obj, orc->rc_path,
+				    orc->rc_pathlen);
+			}
+			orc = AVL_NEXT(&other_side->rcl_by_path, orc);
+		}
+
+		kmem_free(prefix, dirlen + 2);
+	}
+}
+
+/*
+ * Standalone-path cross-reference driver: paths with no linkpool
+ * involvement on any branch go through the samepath logic carried
+ * from the first engine. Pass 1 merge-walks the two by_path trees
+ * (obj-matched pairs first, then cross-object content pairs);
+ * pass 2 crosses moves by object; pass 3 sweeps deleted
+ * directories.
+ */
+static int
+rebase_crossref_standalone(rebase_state_t *rs)
+{
+	rebase_changelist_t *left = &rs->rs_left_changes;
+	rebase_changelist_t *right = &rs->rs_right_changes;
+	rebase_change_t *lrc, *rrc;
+	rebase_walk_ctx_t rwc;
+	int err = 0;
+
+	memset(&rwc, 0, sizeof (rwc));
+	rwc.rwc_rs = rs;
+	rwc.rwc_os[REBASE_WALK_LEFT] = rs->rs_left_os;
+	rwc.rwc_os[REBASE_WALK_BASE] = rs->rs_base_os;
+	rwc.rwc_os[REBASE_WALK_RIGHT] = rs->rs_right_os;
+	rwc.rwc_sa[REBASE_WALK_LEFT] = rs->rs_left_sa;
+	rwc.rwc_sa[REBASE_WALK_BASE] = rs->rs_base_sa;
+	rwc.rwc_sa[REBASE_WALK_RIGHT] = rs->rs_right_sa;
+	rwc.rwc_za = zap_attribute_alloc();
+
+	lrc = avl_first(&left->rcl_by_path);
+	rrc = avl_first(&right->rcl_by_path);
+
+	while (err == 0 && lrc != NULL && rrc != NULL) {
+		int cmp = strcmp(lrc->rc_path, rrc->rc_path);
+
+		if (cmp < 0) {
+			const char *p = lrc->rc_path;
+
+			while (lrc != NULL &&
+			    strcmp(lrc->rc_path, p) == 0)
+				lrc = AVL_NEXT(&left->rcl_by_path,
+				    lrc);
+			continue;
+		}
+		if (cmp > 0) {
+			const char *p = rrc->rc_path;
+
+			while (rrc != NULL &&
+			    strcmp(rrc->rc_path, p) == 0)
+				rrc = AVL_NEXT(&right->rcl_by_path,
+				    rrc);
+			continue;
+		}
+
+		{
+			const char *path = lrc->rc_path;
+			rebase_change_t *lfirst = lrc, *rfirst = rrc;
+			rebase_change_t *l, *r;
+			boolean_t standalone =
+			    rebase_path_standalone(rs, path);
+
+			while (lrc != NULL &&
+			    strcmp(lrc->rc_path, path) == 0)
+				lrc = AVL_NEXT(&left->rcl_by_path,
+				    lrc);
+			while (rrc != NULL &&
+			    strcmp(rrc->rc_path, path) == 0)
+				rrc = AVL_NEXT(&right->rcl_by_path,
+				    rrc);
+			if (!standalone)
+				continue;
+
+			/* Same-object pairs first. */
+			for (l = lfirst; err == 0 && l != lrc;
+			    l = AVL_NEXT(&left->rcl_by_path, l)) {
+				for (r = rfirst; err == 0 && r != rrc;
+				    r = AVL_NEXT(&right->rcl_by_path,
+				    r)) {
+					if (l->rc_obj != r->rc_obj)
+						continue;
+					err = rebase_samepath_pair(rs,
+					    &rwc, l, r);
+				}
+			}
+
+			/* Cross-object content-bearing pairs. */
+			for (l = lfirst; err == 0 && l != lrc;
+			    l = AVL_NEXT(&left->rcl_by_path, l)) {
+				if (l->rc_content_op ==
+				    REBASE_CONTENT_DELETE)
+					continue;
+				for (r = rfirst; err == 0 && r != rrc;
+				    r = AVL_NEXT(&right->rcl_by_path,
+				    r)) {
+					if (l->rc_obj == r->rc_obj ||
+					    r->rc_content_op ==
+					    REBASE_CONTENT_DELETE)
+						continue;
+					err = rebase_samepath_pair(rs,
+					    &rwc, l, r);
+				}
+			}
+		}
+	}
+
+	if (err == 0) {
+		rebase_crossref_moves(rs);
+		rebase_crossref_dir_deletes_one(rs,
+		    &rs->rs_left_changes, &rs->rs_right_changes);
+		rebase_crossref_dir_deletes_one(rs,
+		    &rs->rs_right_changes, &rs->rs_left_changes);
+	}
+
+	zap_attribute_free(rwc.rwc_za);
+
+	if (err == ENOENT)
+		err = SET_ERROR(EIO);
+	return (err);
+}
+
+/*
+ * Find or create the final group for one target identity.
+ */
+static rebase_linkpool_group_t *
+rebase_group(rebase_state_t *rs, const rebase_mtarget_t *tgt)
+{
+	rebase_linkpool_group_t key, *rlpg;
+	avl_index_t where;
+
+	key.rlpg_target = *tgt;
+	rlpg = avl_find(&rs->rs_groups, &key, &where);
+	if (rlpg != NULL)
+		return (rlpg);
+
+	rlpg = kmem_zalloc(sizeof (*rlpg), KM_SLEEP);
+	rlpg->rlpg_target = *tgt;
+	if (tgt->rmt_kind == REBASE_TARGET_ANCHOR ||
+	    tgt->rmt_kind == REBASE_TARGET_FRAGMENT)
+		rlpg->rlpg_lineage = tgt->rmt_linkpool;
+	list_create(&rlpg->rlpg_members, sizeof (rebase_ppath_t),
+	    offsetof(rebase_ppath_t, rpp_node));
+	avl_insert(&rs->rs_groups, rlpg, where);
+	rs->rs_group_count++;
+	return (rlpg);
+}
+
+/*
+ * Assemble the final linkpool groups from the merged rows. A row
+ * joins a group when its final is a linkpool destination, or when
+ * it is a continuing member (SAME_AS_BASE with a base-table pool)
+ * -- the continuing members are what give a content-only pool edit
+ * a group at all, and what give phase F its rosters. Fragment and
+ * novel contributors are recovered by probing the branch tables
+ * through member paths whose side target names the group.
+ */
+static void
+rebase_build_groups(rebase_state_t *rs)
+{
+	rebase_ppath_t *rpp;
+
+	for (rpp = avl_first(&rs->rs_ppaths); rpp != NULL;
+	    rpp = AVL_NEXT(&rs->rs_ppaths, rpp)) {
+		const rebase_mtarget_t *f = &rpp->rpp_final;
+		rebase_mtarget_t tgt;
+		rebase_linkpool_group_t *rlpg;
+		rebase_linkpool_t *lp;
+
+		switch (f->rmt_kind) {
+		case REBASE_TARGET_ANCHOR:
+		case REBASE_TARGET_FRAGMENT:
+		case REBASE_TARGET_NOVEL:
+			tgt = *f;
+			break;
+		case REBASE_TARGET_SAME_AS_BASE:
+			lp = rebase_linkpool_of(&rs->rs_base_linkpools,
+			    rpp->rpp_path);
+			if (lp == NULL)
+				continue;
+			tgt.rmt_kind = REBASE_TARGET_ANCHOR;
+			tgt.rmt_linkpool = lp->rlp_obj;
+			tgt.rmt_fragment = 0;
+			break;
+		default:
+			continue;
+		}
+
+		rlpg = rebase_group(rs, &tgt);
+		list_insert_tail(&rlpg->rlpg_members, rpp);
+
+		if (tgt.rmt_kind == REBASE_TARGET_ANCHOR)
+			continue;
+
+		if (rlpg->rlpg_left_obj == 0 &&
+		    rebase_mtarget_equal(&rpp->rpp_left, &tgt)) {
+			lp = rebase_linkpool_of(&rs->rs_left_linkpools,
+			    rpp->rpp_path);
+			if (lp != NULL)
+				rlpg->rlpg_left_obj = lp->rlp_obj;
+		}
+		if (rlpg->rlpg_right_obj == 0 &&
+		    rebase_mtarget_equal(&rpp->rpp_right, &tgt)) {
+			lp = rebase_linkpool_of(
+			    &rs->rs_right_linkpools, rpp->rpp_path);
+			if (lp != NULL)
+				rlpg->rlpg_right_obj = lp->rlp_obj;
+		}
+	}
+}
+
+/*
+ * Resolve one side's content object for a group. An explicit
+ * contributor (a fragment or novel pool recovered at build time)
+ * wins; otherwise a group with a base lineage reads that side's
+ * version of the lineage when it survives there -- which also
+ * covers the non-splitting side of a one-sided split, whose answer
+ * for the severed paths is the parent's data. 0 means the side has
+ * no data for this group.
+ */
+static int
+rebase_group_side_obj(rebase_state_t *rs,
+    rebase_linkpool_group_t *rlpg, objset_t *side_os,
+    const sa_attr_type_t *side_sa, uint64_t contributor,
+    uint64_t *objp)
+{
+	dmu_object_info_t doi;
+	boolean_t holds;
+	int err;
+
+	*objp = 0;
+	if (contributor != 0) {
+		*objp = contributor;
+		return (0);
+	}
+	if (rlpg->rlpg_lineage == 0)
+		return (0);
+
+	err = dmu_object_info(side_os, rlpg->rlpg_lineage, &doi);
+	if (err == ENOENT)
+		return (0);
+	if (err != 0)
+		return (err);
+
+	err = rebase_lineage_holds(rs, side_os, side_sa,
+	    rlpg->rlpg_lineage, &holds);
+	if (err != 0)
+		return (err);
+	if (holds)
+		*objp = rlpg->rlpg_lineage;
+	return (0);
+}
+
+/*
+ * Cross-reference phase E: per-group three-way content merge.
+ * Edited-ness against base is decided first (the fork-txg fast
+ * path answers for free on untouched sides), so the side-vs-side
+ * compare only ever runs for same-lineage nodes dirty on both
+ * sides -- and both-edited-to-the-same-value is convergence, not
+ * a conflict. Anything else is REBASE_CONFLICT_LINKPOOL_CONTENT,
+ * scoped to the group with the member list as alt paths, and the
+ * group keeps pre-merge content (REBASE_SRC_CONFLICT; rs_policy
+ * arms land with the ioctl flags).
+ */
+static int
+rebase_content_merge(rebase_state_t *rs)
+{
+	rebase_linkpool_group_t *rlpg;
+	rebase_walk_ctx_t rwc;
+	int err = 0;
+
+	memset(&rwc, 0, sizeof (rwc));
+	rwc.rwc_rs = rs;
+	rwc.rwc_os[REBASE_WALK_LEFT] = rs->rs_left_os;
+	rwc.rwc_os[REBASE_WALK_BASE] = rs->rs_base_os;
+	rwc.rwc_os[REBASE_WALK_RIGHT] = rs->rs_right_os;
+	rwc.rwc_sa[REBASE_WALK_LEFT] = rs->rs_left_sa;
+	rwc.rwc_sa[REBASE_WALK_BASE] = rs->rs_base_sa;
+	rwc.rwc_sa[REBASE_WALK_RIGHT] = rs->rs_right_sa;
+	rwc.rwc_za = zap_attribute_alloc();
+
+	for (rlpg = avl_first(&rs->rs_groups); rlpg != NULL && err == 0;
+	    rlpg = AVL_NEXT(&rs->rs_groups, rlpg)) {
+		uint64_t lobj, robj;
+		boolean_t l_edited = B_FALSE, r_edited = B_FALSE;
+		boolean_t same;
+
+		err = rebase_group_side_obj(rs, rlpg, rs->rs_left_os,
+		    rs->rs_left_sa, rlpg->rlpg_left_obj, &lobj);
+		if (err == 0)
+			err = rebase_group_side_obj(rs, rlpg,
+			    rs->rs_right_os, rs->rs_right_sa,
+			    rlpg->rlpg_right_obj, &robj);
+		if (err != 0)
+			break;
+		rlpg->rlpg_left_obj = lobj;
+		rlpg->rlpg_right_obj = robj;
+
+		if (lobj != 0) {
+			if (rlpg->rlpg_lineage == 0) {
+				l_edited = B_TRUE;
+			} else {
+				err = rebase_is_hysterical(&rwc,
+				    REBASE_WALK_BASE,
+				    rlpg->rlpg_lineage,
+				    REBASE_WALK_LEFT, lobj, B_TRUE,
+				    &same);
+				if (err != 0)
+					break;
+				l_edited = !same;
+			}
+		}
+		if (robj != 0) {
+			if (rlpg->rlpg_lineage == 0) {
+				r_edited = B_TRUE;
+			} else {
+				err = rebase_is_hysterical(&rwc,
+				    REBASE_WALK_BASE,
+				    rlpg->rlpg_lineage,
+				    REBASE_WALK_RIGHT, robj, B_TRUE,
+				    &same);
+				if (err != 0)
+					break;
+				r_edited = !same;
+			}
+		}
+
+		if (!l_edited && !r_edited) {
+			rlpg->rlpg_src = REBASE_SRC_BASE;
+		} else if (!l_edited) {
+			rlpg->rlpg_src = REBASE_SRC_RIGHT;
+		} else if (!r_edited) {
+			rlpg->rlpg_src = REBASE_SRC_LEFT;
+		} else {
+			err = rebase_is_hysterical(&rwc,
+			    REBASE_WALK_LEFT, lobj,
+			    REBASE_WALK_RIGHT, robj, B_FALSE, &same);
+			if (err != 0)
+				break;
+			if (same) {
+				/* Convergent: both edited alike. */
+				rlpg->rlpg_src = REBASE_SRC_LEFT;
+			} else {
+				rebase_ppath_t *rpp;
+				uint64_t obj;
+
+				rlpg->rlpg_src = REBASE_SRC_CONFLICT;
+				obj = (rlpg->rlpg_lineage != 0) ?
+				    rlpg->rlpg_lineage :
+				    ((rlpg->rlpg_target.rmt_kind ==
+				    REBASE_TARGET_NOVEL) ?
+				    rlpg->rlpg_target.rmt_linkpool :
+				    rlpg->rlpg_target.rmt_fragment);
+				for (rpp = list_head(
+				    &rlpg->rlpg_members); rpp != NULL;
+				    rpp = list_next(
+				    &rlpg->rlpg_members, rpp)) {
+					rebase_conflict_add(rs,
+					    REBASE_CONFLICT_LINKPOOL_CONTENT,
+					    obj, rpp->rpp_path,
+					    rpp->rpp_pathlen);
+				}
+			}
+		}
+	}
+
+	zap_attribute_free(rwc.rwc_za);
+
+	if (err == ENOENT)
+		err = SET_ERROR(EIO);
+	return (err);
+}
+
+/*
+ * Cross-reference phase F: the consistency sweep. Emits the
+ * warnings that keep hardlink merges honest, then compiles the
+ * action list the apply epic will consume. Purely in-memory: every
+ * fact it needs was computed by phases D and E. Conflicted rows
+ * and conflict-source groups produce no actions -- unresolved
+ * work belongs to phase 2, not the action list.
+ */
+static void
+rebase_consistency_sweep(rebase_state_t *rs)
+{
+	rebase_linkpool_group_t *rlpg;
+	rebase_ppath_t *rpp;
+	rebase_change_t *rc;
+
+	for (rlpg = avl_first(&rs->rs_groups); rlpg != NULL;
+	    rlpg = AVL_NEXT(&rs->rs_groups, rlpg)) {
+		rebase_linkpool_table_t *ed_rlpt;
+		rebase_linkpool_t *ed_lp;
+		rebase_linkpool_link_t *link;
+		uint64_t ed_obj;
+
+		if (rlpg->rlpg_src == REBASE_SRC_RIGHT) {
+			rebase_action_add(rs, REBASE_ACTION_WRITE,
+			    ((rebase_ppath_t *)list_head(
+			    &rlpg->rlpg_members))->rpp_path,
+			    ((rebase_ppath_t *)list_head(
+			    &rlpg->rlpg_members))->rpp_pathlen,
+			    rlpg->rlpg_left_obj, REBASE_SRC_RIGHT,
+			    rlpg->rlpg_right_obj);
+
+			/*
+			 * Right's data lands on paths the left
+			 * branch never looked at: say so.
+			 */
+			for (rpp = list_head(&rlpg->rlpg_members);
+			    rpp != NULL; rpp = list_next(
+			    &rlpg->rlpg_members, rpp)) {
+				if (rpp->rpp_left.rmt_kind ==
+				    REBASE_TARGET_SAME_AS_BASE) {
+					rebase_warning_add(rs,
+					    REBASE_WARN_IMPLIED_CHANGE,
+					    rlpg->rlpg_lineage,
+					    rpp->rpp_path,
+					    rpp->rpp_pathlen);
+				}
+			}
+		}
+
+		/*
+		 * REBASE_WARN_LINKPOOL_SHRUNK: the winning editor's
+		 * own roster contains a path that did not survive
+		 * into the merged roster.
+		 */
+		if (rlpg->rlpg_src != REBASE_SRC_LEFT &&
+		    rlpg->rlpg_src != REBASE_SRC_RIGHT)
+			continue;
+		if (rlpg->rlpg_src == REBASE_SRC_LEFT) {
+			ed_rlpt = &rs->rs_left_linkpools;
+			ed_obj = rlpg->rlpg_left_obj;
+		} else {
+			ed_rlpt = &rs->rs_right_linkpools;
+			ed_obj = rlpg->rlpg_right_obj;
+		}
+		if (ed_obj == 0)
+			continue;
+		ed_lp = rebase_linkpool_first_obj(ed_rlpt, ed_obj);
+		if (ed_lp == NULL)
+			continue;
+		for (link = list_head(&ed_lp->rlp_links);
+		    link != NULL;
+		    link = list_next(&ed_lp->rlp_links, link)) {
+			rebase_ppath_t *row;
+
+			row = rebase_ppath_find(rs, link->rlpl_path);
+			if (row == NULL)
+				continue;
+			if (rebase_mtarget_equal(&row->rpp_final,
+			    &rlpg->rlpg_target))
+				continue;
+			if (row->rpp_final.rmt_kind ==
+			    REBASE_TARGET_SAME_AS_BASE)
+				continue;
+			rebase_warning_add(rs,
+			    REBASE_WARN_LINKPOOL_SHRUNK,
+			    rlpg->rlpg_lineage, link->rlpl_path,
+			    link->rlpl_pathlen);
+			break;
+		}
+	}
+
+	/*
+	 * Row-driven actions: membership deltas the LEFT side has
+	 * not already applied to itself. Left-expressed changes need
+	 * nothing -- the left HEAD is the apply target. Standalone
+	 * paths are skipped even when they have rows (phase B builds
+	 * rows for every changelist path): the standalone sweep
+	 * below owns them, and emitting from both would double-count
+	 * a right-side delete.
+	 */
+	for (rpp = avl_first(&rs->rs_ppaths); rpp != NULL;
+	    rpp = AVL_NEXT(&rs->rs_ppaths, rpp)) {
+		const rebase_mtarget_t *f = &rpp->rpp_final;
+		boolean_t left_silent = (rpp->rpp_left.rmt_kind ==
+		    REBASE_TARGET_SAME_AS_BASE);
+
+		if (rebase_path_standalone(rs, rpp->rpp_path))
+			continue;
+
+		switch (f->rmt_kind) {
+		case REBASE_TARGET_GONE:
+			if (left_silent) {
+				rebase_action_add(rs,
+				    REBASE_ACTION_UNLINK,
+				    rpp->rpp_path, rpp->rpp_pathlen,
+				    0, REBASE_SRC_RIGHT, 0);
+			}
+			break;
+		case REBASE_TARGET_STANDALONE:
+			if (left_silent) {
+				rebase_linkpool_t *base_lp;
+
+				rc = rebase_change_at(
+				    &rs->rs_right_changes,
+				    rpp->rpp_path);
+				base_lp = rebase_linkpool_of(
+				    &rs->rs_base_linkpools,
+				    rpp->rpp_path);
+				/*
+				 * Standalone is an identity change
+				 * only when right put a NOVEL
+				 * object at this path. When
+				 * right's object IS the base pool
+				 * object, the pool merely shrank
+				 * around this survivor: an edit is
+				 * an in-place WRITE, and silence
+				 * is silence -- the other rows'
+				 * removals do the link arithmetic.
+				 */
+				if (rc == NULL) {
+					break;
+				} else if (base_lp == NULL ||
+				    rc->rc_obj != base_lp->rlp_obj) {
+					rebase_action_add(rs,
+					    REBASE_ACTION_SEVER,
+					    rpp->rpp_path,
+					    rpp->rpp_pathlen,
+					    0, REBASE_SRC_RIGHT,
+					    rc->rc_obj);
+				} else if (rc->rc_content_op ==
+				    REBASE_CONTENT_EDIT ||
+				    rc->rc_content_op ==
+				    REBASE_CONTENT_MOVE_EDIT) {
+					rebase_action_add(rs,
+					    REBASE_ACTION_WRITE,
+					    rpp->rpp_path,
+					    rpp->rpp_pathlen,
+					    base_lp->rlp_obj,
+					    REBASE_SRC_RIGHT,
+					    rc->rc_obj);
+				}
+			}
+			break;
+		case REBASE_TARGET_ANCHOR:
+		case REBASE_TARGET_FRAGMENT:
+		case REBASE_TARGET_NOVEL:
+			if (!rebase_mtarget_equal(&rpp->rpp_left, f)) {
+				rebase_linkpool_group_t key, *g;
+
+				key.rlpg_target = *f;
+				g = avl_find(&rs->rs_groups, &key,
+				    NULL);
+				rebase_action_add(rs,
+				    REBASE_ACTION_LINK,
+				    rpp->rpp_path, rpp->rpp_pathlen,
+				    g != NULL ? g->rlpg_left_obj : 0,
+				    REBASE_SRC_RIGHT,
+				    g != NULL ? g->rlpg_right_obj :
+				    0);
+			}
+			break;
+		default:
+			break;
+		}
+	}
+
+	/*
+	 * Standalone right-side changes: paths the samepath pass
+	 * left unconflicted and the left side never touched must be
+	 * replayed onto the left HEAD.
+	 */
+	for (rc = avl_first(&rs->rs_right_changes.rcl_by_path);
+	    rc != NULL;
+	    rc = AVL_NEXT(&rs->rs_right_changes.rcl_by_path, rc)) {
+		if (!rebase_path_standalone(rs, rc->rc_path))
+			continue;
+		if (rebase_change_at(&rs->rs_left_changes,
+		    rc->rc_path) != NULL)
+			continue;
+		if (rebase_conflict_covers(&rs->rs_manifest,
+		    rc->rc_path, rc->rc_obj))
+			continue;
+
+		switch (rc->rc_content_op) {
+		case REBASE_CONTENT_ADD:
+			rebase_action_add(rs, REBASE_ACTION_COPY,
+			    rc->rc_path, rc->rc_pathlen, 0,
+			    REBASE_SRC_RIGHT, rc->rc_obj);
+			break;
+		case REBASE_CONTENT_EDIT:
+			rebase_action_add(rs, REBASE_ACTION_WRITE,
+			    rc->rc_path, rc->rc_pathlen, 0,
+			    REBASE_SRC_RIGHT, rc->rc_obj);
+			break;
+		case REBASE_CONTENT_DELETE:
+			rebase_action_add(rs, REBASE_ACTION_UNLINK,
+			    rc->rc_path, rc->rc_pathlen, 0,
+			    REBASE_SRC_RIGHT, 0);
+			break;
+		case REBASE_CONTENT_MOVE:
+		case REBASE_CONTENT_MOVE_EDIT:
+			rebase_action_add(rs, REBASE_ACTION_UNLINK,
+			    rc->rc_old_path, rc->rc_old_pathlen, 0,
+			    REBASE_SRC_RIGHT, 0);
+			rebase_action_add(rs, REBASE_ACTION_LINK,
+			    rc->rc_path, rc->rc_pathlen, 0,
+			    REBASE_SRC_RIGHT, rc->rc_obj);
+			if (rc->rc_content_op ==
+			    REBASE_CONTENT_MOVE_EDIT) {
+				rebase_action_add(rs,
+				    REBASE_ACTION_WRITE,
+				    rc->rc_path, rc->rc_pathlen, 0,
+				    REBASE_SRC_RIGHT, rc->rc_obj);
+			}
+			break;
+		default:
+			break;
+		}
+	}
+}
+
+static const char *
+rebase_conflict_type_name(rebase_conflict_type_t type)
+{
+	switch (type) {
+	case REBASE_CONFLICT_BOTH_MODIFIED:
+		return ("BOTH_MODIFIED");
+	case REBASE_CONFLICT_CREATE_CREATE:
+		return ("CREATE_CREATE");
+	case REBASE_CONFLICT_MODIFY_DELETE:
+		return ("MODIFY_DELETE");
+	case REBASE_CONFLICT_DELETE_MODIFY:
+		return ("DELETE_MODIFY");
+	case REBASE_CONFLICT_MOVE_DIVERGE:
+		return ("MOVE_DIVERGE");
+	case REBASE_CONFLICT_MOVE_VS_EDIT:
+		return ("MOVE_VS_EDIT");
+	case REBASE_CONFLICT_DIR_DELETE_VS_EDIT:
+		return ("DIR_DELETE_VS_EDIT");
+	case REBASE_CONFLICT_DELETE_VS_RELINK:
+		return ("DELETE_VS_RELINK");
+	case REBASE_CONFLICT_DIVERGENT_MEMBERSHIP:
+		return ("DIVERGENT_MEMBERSHIP");
+	case REBASE_CONFLICT_LINKPOOL_CONTENT:
+		return ("LINKPOOL_CONTENT");
+	case REBASE_CONFLICT_NOVEL_LINKPOOL_OVERLAP:
+		return ("NOVEL_LINKPOOL_OVERLAP");
+	default:
+		return ("UNKNOWN");
+	}
+}
+
+static const char *
+rebase_warning_kind_name(rebase_warning_kind_t kind)
+{
+	switch (kind) {
+	case REBASE_WARN_IMPLIED_CHANGE:
+		return ("IMPLIED_CHANGE");
+	case REBASE_WARN_LINKPOOL_SHRUNK:
+		return ("LINKPOOL_SHRUNK");
+	case REBASE_WARN_DANGLING_SYMLINK:
+		return ("DANGLING_SYMLINK");
+	default:
+		return ("UNKNOWN");
+	}
+}
+
+/*
+ * The v1 userland contract (user decision 2026-08-22): ONLY
+ * conflicts, warnings, and counts cross to userland -- never the
+ * action list. When the conflict list would exceed the cap, the
+ * full totals still go out, the first entries fit, and an explicit
+ * truncated flag tells userland to read the on-disk manifest
+ * (emit-part-2) for the rest; fd streaming is the v2 escape hatch.
+ */
+#define	REBASE_EMIT_MAX_CONFLICTS	512
+
+static void
+rebase_manifest_to_nvl(rebase_state_t *rs, nvlist_t *nvl)
+{
+	rebase_manifest_t *rm = &rs->rs_manifest;
+	rebase_conflict_t *rcf;
+	rebase_warning_t *rw;
+	nvlist_t **arr;
+	uint_t n, i;
+
+	fnvlist_add_uint64(nvl, "nconflicts", rm->rm_nconflicts);
+	fnvlist_add_uint64(nvl, "nwarnings", rm->rm_nwarnings);
+	fnvlist_add_uint64(nvl, "nactions", rm->rm_nactions);
+	fnvlist_add_uint64(nvl, "left_nchanges",
+	    rs->rs_left_changes.rcl_count);
+	fnvlist_add_uint64(nvl, "right_nchanges",
+	    rs->rs_right_changes.rcl_count);
+	fnvlist_add_boolean_value(nvl, "truncated",
+	    rm->rm_nconflicts > REBASE_EMIT_MAX_CONFLICTS);
+
+	n = MIN(rm->rm_nconflicts, REBASE_EMIT_MAX_CONFLICTS);
+	if (n > 0) {
+		arr = kmem_alloc(n * sizeof (nvlist_t *), KM_SLEEP);
+		i = 0;
+		for (rcf = list_head(&rm->rm_conflicts);
+		    rcf != NULL && i < n;
+		    rcf = list_next(&rm->rm_conflicts, rcf)) {
+			arr[i] = fnvlist_alloc();
+			fnvlist_add_string(arr[i], "type",
+			    rebase_conflict_type_name(rcf->rcf_type));
+			fnvlist_add_string(arr[i], "path",
+			    rcf->rcf_path);
+			fnvlist_add_uint64(arr[i], "obj",
+			    rcf->rcf_obj);
+			fnvlist_add_uint64(arr[i], "nalt",
+			    rcf->rcf_nalt);
+			if (rcf->rcf_nalt > 0) {
+				fnvlist_add_string_array(arr[i],
+				    "alt_paths",
+				    (const char * const *)
+				    rcf->rcf_alt_paths,
+				    rcf->rcf_nalt);
+			}
+			i++;
+		}
+		fnvlist_add_nvlist_array(nvl, "conflicts",
+		    (const nvlist_t * const *)arr, n);
+		for (i = 0; i < n; i++)
+			fnvlist_free(arr[i]);
+		kmem_free(arr, n * sizeof (nvlist_t *));
+	}
+
+	n = rm->rm_nwarnings;
+	if (n > 0) {
+		arr = kmem_alloc(n * sizeof (nvlist_t *), KM_SLEEP);
+		i = 0;
+		for (rw = list_head(&rm->rm_warnings);
+		    rw != NULL && i < n;
+		    rw = list_next(&rm->rm_warnings, rw)) {
+			arr[i] = fnvlist_alloc();
+			fnvlist_add_string(arr[i], "kind",
+			    rebase_warning_kind_name(rw->rw_kind));
+			fnvlist_add_string(arr[i], "path",
+			    rw->rw_path);
+			fnvlist_add_uint64(arr[i], "obj",
+			    rw->rw_obj);
+			i++;
+		}
+		fnvlist_add_nvlist_array(nvl, "warnings",
+		    (const nvlist_t * const *)arr, n);
+		for (i = 0; i < n; i++)
+			fnvlist_free(arr[i]);
+		kmem_free(arr, n * sizeof (nvlist_t *));
+	}
+}
+
 int
 dsl_rebase(const char *left_ds, const char *right_ds, nvlist_t *outnvl)
 {
@@ -3865,7 +5013,6 @@ dsl_rebase(const char *left_ds, const char *right_ds, nvlist_t *outnvl)
 	boolean_t right_is_head;
 	int err;
 
-	(void) outnvl;
 
 	memset(&state, 0, sizeof (state));
 	right_snap = NULL;
@@ -3978,14 +5125,29 @@ dsl_rebase(const char *left_ds, const char *right_ds, nvlist_t *outnvl)
 	if (err == 0)
 		err = rebase_membership_merge(&state);
 
-	/*
-	 * Diff pipeline complete through cross-reference phase D.
-	 * Subsequent issues fill in phases E-F, emit, and apply
-	 * here; until they land, a successful diff still exits
-	 * with ENOSYS.
-	 */
+	/* Standalone paths: the carried samepath conflict logic. */
 	if (err == 0)
-		err = SET_ERROR(ENOSYS);
+		err = rebase_crossref_standalone(&state);
+
+	/* Phase E: assemble the groups, merge content three-way. */
+	if (err == 0) {
+		rebase_build_groups(&state);
+		err = rebase_content_merge(&state);
+	}
+
+	/* Phase F: warnings and the action list. */
+	if (err == 0)
+		rebase_consistency_sweep(&state);
+
+	/*
+	 * The diff pipeline is complete: a successful rebase now
+	 * returns 0 with the summary manifest -- conflicts,
+	 * warnings, and counts, never the action list -- in outnvl.
+	 * The on-disk manifest (emit-part-2) and the apply epic
+	 * land here next.
+	 */
+	if (err == 0 && outnvl != NULL)
+		rebase_manifest_to_nvl(&state, outnvl);
 
 	rebase_state_teardown(&state);
 long_rele:

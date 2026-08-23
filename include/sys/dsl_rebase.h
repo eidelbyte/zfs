@@ -277,6 +277,14 @@ typedef enum rebase_content_src {
  * Member prefix rlpg_ = "rebase linkpool group".
  */
 typedef struct rebase_linkpool_group {
+	/*
+	 * The group's identity: the shared rpp_final of its member
+	 * rows (ANCHOR, FRAGMENT, or NOVEL kind), which is also the
+	 * AVL key -- kind disambiguates a recycled branch pool's
+	 * novel id from an anchored lineage at the same number.
+	 */
+	rebase_mtarget_t	rlpg_target;
+
 	uint64_t		rlpg_lineage;	/* base obj, 0 if novel	*/
 	uint64_t		rlpg_left_obj;	/* contributing objs	*/
 	uint64_t		rlpg_right_obj;	/*   (0 if absent)	*/
@@ -484,6 +492,14 @@ typedef struct rebase_state {
 	 */
 	avl_tree_t		rs_ppaths;
 	uint_t			rs_ppath_count;
+
+	/*
+	 * Final linkpool groups (phase D/E): one per base lineage or
+	 * unified novel/fragment identity with any membership or
+	 * content activity, keyed by rlpg_target.
+	 */
+	avl_tree_t		rs_groups;
+	uint_t			rs_group_count;
 
 	/* cross-reference phase output */
 	rebase_manifest_t	rs_manifest;
