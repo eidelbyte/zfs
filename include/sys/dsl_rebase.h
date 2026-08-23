@@ -17,6 +17,7 @@
 #define	_SYS_DSL_REBASE_H
 
 #include <sys/dmu.h>
+#include <sys/sa.h>
 #include <sys/zfs_context.h>
 
 #ifdef	__cplusplus
@@ -439,6 +440,16 @@ typedef struct rebase_state {
 	objset_t		*rs_base_os;
 	objset_t		*rs_right_os;
 
+	/*
+	 * Per-objset SA attribute tables (objset-owned, nothing to
+	 * free). Set up once in state setup; the walk and every
+	 * later phase that reads SA attributes (anchoring's gen
+	 * checks, content merge) share them.
+	 */
+	sa_attr_type_t		*rs_left_sa;
+	sa_attr_type_t		*rs_base_sa;
+	sa_attr_type_t		*rs_right_sa;
+
 	/* root directory object numbers (from MASTER_NODE) */
 	uint64_t		rs_left_root;
 	uint64_t		rs_base_root;
@@ -464,6 +475,15 @@ typedef struct rebase_state {
 	/* collect phase output */
 	rebase_changelist_t	rs_left_changes;
 	rebase_changelist_t	rs_right_changes;
+
+	/*
+	 * Cross-reference phase B output: one rebase_ppath_t row per
+	 * path appearing in either changelist or either branch
+	 * linkpool table (plus the synthesized rows for the old
+	 * paths of collapsed member moves), indexed by path.
+	 */
+	avl_tree_t		rs_ppaths;
+	uint_t			rs_ppath_count;
 
 	/* cross-reference phase output */
 	rebase_manifest_t	rs_manifest;

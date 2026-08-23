@@ -230,6 +230,22 @@ rebase_change_obj_cmp(const void *a, const void *b)
 	return (TREE_ISIGN(strcmp(la->rc_path, lb->rc_path)));
 }
 
+/*
+ * Comparator for the per-path membership rows (cross-reference
+ * phase B). A path has exactly one row, so the key is the path
+ * alone.
+ */
+static int
+rebase_ppath_cmp(const void *a, const void *b)
+{
+	const rebase_ppath_t *la = a;
+	const rebase_ppath_t *lb = b;
+
+	return (TREE_ISIGN(strcmp(la->rpp_path, lb->rpp_path)));
+}
+
+static int rebase_sa_setup(objset_t *os, sa_attr_type_t **sa_tblp);
+
 static void
 rebase_changelist_init(rebase_changelist_t *rcl)
 {
@@ -641,11 +657,29 @@ rebase_state_setup(rebase_state_t *rs, objset_t *left_snap_os,
 	if (err != 0)
 		return (err);
 
+	/*
+	 * SA attribute tables for all three read sources, shared by
+	 * the walk and every later phase that reads SA attributes.
+	 * Objset-owned: nothing to tear down.
+	 */
+	err = rebase_sa_setup(rs->rs_left_os, &rs->rs_left_sa);
+	if (err == 0)
+		err = rebase_sa_setup(rs->rs_base_os, &rs->rs_base_sa);
+	if (err == 0)
+		err = rebase_sa_setup(rs->rs_right_os,
+		    &rs->rs_right_sa);
+	if (err != 0)
+		return (err);
+
 	rebase_changelist_init(&rs->rs_left_changes);
 	rebase_changelist_init(&rs->rs_right_changes);
 	rebase_linkpool_table_init(&rs->rs_base_linkpools);
 	rebase_linkpool_table_init(&rs->rs_left_linkpools);
 	rebase_linkpool_table_init(&rs->rs_right_linkpools);
+	avl_create(&rs->rs_ppaths, rebase_ppath_cmp,
+	    sizeof (rebase_ppath_t), offsetof(rebase_ppath_t,
+	    rpp_avl));
+	rs->rs_ppath_count = 0;
 
 	return (0);
 }
@@ -653,6 +687,17 @@ rebase_state_setup(rebase_state_t *rs, objset_t *left_snap_os,
 static void
 rebase_state_teardown(rebase_state_t *rs)
 {
+	rebase_ppath_t *rpp;
+	void *cookie = NULL;
+
+	while ((rpp = avl_destroy_nodes(&rs->rs_ppaths,
+	    &cookie)) != NULL) {
+		kmem_free(rpp->rpp_path, rpp->rpp_pathlen);
+		kmem_free(rpp, sizeof (*rpp));
+	}
+	avl_destroy(&rs->rs_ppaths);
+	rs->rs_ppath_count = 0;
+
 	rebase_linkpool_table_fini(&rs->rs_right_linkpools);
 	rebase_linkpool_table_fini(&rs->rs_left_linkpools);
 	rebase_linkpool_table_fini(&rs->rs_base_linkpools);
@@ -2308,16 +2353,10 @@ rebase_walk(rebase_state_t *rs)
 	rwc.rwc_os[REBASE_WALK_BASE] = rs->rs_base_os;
 	rwc.rwc_os[REBASE_WALK_RIGHT] = rs->rs_right_os;
 
-	err = rebase_sa_setup(rs->rs_left_os,
-	    &rwc.rwc_sa[REBASE_WALK_LEFT]);
-	if (err == 0)
-		err = rebase_sa_setup(rs->rs_base_os,
-		    &rwc.rwc_sa[REBASE_WALK_BASE]);
-	if (err == 0)
-		err = rebase_sa_setup(rs->rs_right_os,
-		    &rwc.rwc_sa[REBASE_WALK_RIGHT]);
-	if (err != 0)
-		return (err);
+	/* SA tables are state-owned; set up in rebase_state_setup. */
+	rwc.rwc_sa[REBASE_WALK_LEFT] = rs->rs_left_sa;
+	rwc.rwc_sa[REBASE_WALK_BASE] = rs->rs_base_sa;
+	rwc.rwc_sa[REBASE_WALK_RIGHT] = rs->rs_right_sa;
 
 	rwc.rwc_za = zap_attribute_alloc();
 
@@ -2363,6 +2402,456 @@ rebase_walk(rebase_state_t *rs)
 	}
 
 	return (err);
+}
+
+/*
+ * Find the change record at one path in one side's changelist, or
+ * NULL. The by_path index is compound (path, obj), but a path
+ * produces at most one record per side, so a zero-obj probe key
+ * followed by the successor is an exact by-path lookup.
+ */
+static rebase_change_t *
+rebase_change_at(rebase_changelist_t *rcl, const char *path)
+{
+	rebase_change_t key, *rc;
+	avl_index_t where;
+
+	key.rc_path = (char *)(uintptr_t)path;
+	key.rc_obj = 0;
+
+	rc = avl_find(&rcl->rcl_by_path, &key, &where);
+	if (rc == NULL) {
+		rc = avl_nearest(&rcl->rcl_by_path, where, AVL_AFTER);
+		if (rc != NULL && strcmp(rc->rc_path, path) != 0)
+			rc = NULL;
+	}
+	return (rc);
+}
+
+/*
+ * Does object obj carry the same lineage in base and in the side?
+ * The engine-wide recycling guard, composed the same way the walk
+ * composes it: the untouched-since-fork shortcut answers for free
+ * when it can, and ZPL_GEN (the birth certificate) decides
+ * otherwise. Both dnodes must exist; the callers have verified
+ * that, so ENOENT from here is corruption (converted at the phase
+ * boundary).
+ */
+static int
+rebase_lineage_holds(rebase_state_t *rs, objset_t *side_os,
+    const sa_attr_type_t *side_sa, uint64_t obj, boolean_t *holdsp)
+{
+	sa_handle_t *hdl_base, *hdl_side;
+	int err;
+
+	err = rebase_untouched_since_fork(side_os, obj,
+	    rs->rs_fork_txg, holdsp);
+	if (err != 0 || *holdsp)
+		return (err);
+
+	err = sa_handle_get(rs->rs_base_os, obj, NULL,
+	    SA_HDL_PRIVATE, &hdl_base);
+	if (err != 0)
+		return (err);
+	err = sa_handle_get(side_os, obj, NULL, SA_HDL_PRIVATE,
+	    &hdl_side);
+	if (err != 0) {
+		sa_handle_destroy(hdl_base);
+		return (err);
+	}
+	err = rebase_same_gen(hdl_base, rs->rs_base_sa, hdl_side,
+	    side_sa, holdsp);
+	sa_handle_destroy(hdl_side);
+	sa_handle_destroy(hdl_base);
+	return (err);
+}
+
+/*
+ * Cross-reference phase A, per linkpool: which base lineage (if
+ * any) is this branch linkpool?
+ *
+ * Anchoring is to the base LINEAGE, not the base linkpool table: a
+ * branch linkpool over a dnode that was standalone in base (absent
+ * from rs_base_linkpools) still anchors -- base standalone nodes
+ * are degenerate one-member linkpools. This keeps phase C's
+ * heuristics restricted to nodes that genuinely did not exist at
+ * the fork.
+ *
+ * The touched-since-fork disambiguation (same node rewritten, or
+ * index recycled?) is the ZPL_GEN guard, NOT the planning doc's
+ * survivors scan over the diff trees (doc corrected 2026-08-23):
+ * a dnode whose base paths all turned over on the branch while its
+ * nlink never reached zero has an empty survivor set but an intact
+ * lineage -- gen answers directly, does not inherit diff-tree
+ * correctness, and is the same guard the rest of the engine trusts.
+ */
+static int
+rebase_classify_linkpool(rebase_state_t *rs, objset_t *side_os,
+    const sa_attr_type_t *side_sa, rebase_linkpool_t *lp)
+{
+	dmu_object_info_t doi;
+	boolean_t holds;
+	int err;
+
+	err = dmu_object_info(rs->rs_base_os, lp->rlp_obj, &doi);
+	if (err == ENOENT) {
+		/* Born after the fork. */
+		lp->rlp_state = REBASE_LINKPOOL_NOVEL;
+		lp->rlp_anchor = 0;
+		return (0);
+	}
+	if (err != 0)
+		return (err);
+
+	err = rebase_lineage_holds(rs, side_os, side_sa,
+	    lp->rlp_obj, &holds);
+	if (err != 0)
+		return (err);
+
+	if (holds) {
+		lp->rlp_state = REBASE_LINKPOOL_ANCHORED;
+		lp->rlp_anchor = lp->rlp_obj;
+	} else {
+		/* Index reused for an unrelated node: treat as novel. */
+		lp->rlp_state = REBASE_LINKPOOL_RECYCLED;
+		lp->rlp_anchor = 0;
+	}
+	return (0);
+}
+
+/*
+ * Split-fragment rescue: a NOVEL or RECYCLED linkpool whose member
+ * records carry REBASE_LINKPOOL_MOVED provenance from exactly one
+ * base linkpool is the severed half of a split, with known
+ * parentage -- it gets the parent's base data for content merging
+ * and never touches phase C's heuristics. ADDED members are
+ * neutral (paths that joined the fragment after the split).
+ *
+ * Guards, all falling back to leaving the state alone
+ * (conservative -- phase C never invents parentage): two distinct
+ * parents disqualify (a novel linkpool drawing from two base
+ * linkpools is a merge of severed halves, not one fragment), and
+ * so does a parent numerically equal to the linkpool's own object
+ * -- that is the recycled-in-place shape (MOVED with from == to ==
+ * obj), where the paths never left the roster and the new node's
+ * content owes nothing to the lineage it replaced.
+ */
+static void
+rebase_fragment_rescue(rebase_changelist_t *rcl,
+    rebase_linkpool_t *lp)
+{
+	rebase_linkpool_link_t *link;
+	uint64_t parent = 0;
+
+	for (link = list_head(&lp->rlp_links); link != NULL;
+	    link = list_next(&lp->rlp_links, link)) {
+		rebase_change_t *rc;
+
+		rc = rebase_change_at(rcl, link->rlpl_path);
+		if (rc == NULL || rc->rc_obj != lp->rlp_obj)
+			return;
+
+		switch (rc->rc_linkpool_op) {
+		case REBASE_LINKPOOL_MOVED:
+			if (rc->rc_linkpool_from == lp->rlp_obj)
+				return;
+			if (parent == 0)
+				parent = rc->rc_linkpool_from;
+			else if (parent != rc->rc_linkpool_from)
+				return;
+			break;
+		case REBASE_LINKPOOL_ADDED:
+			break;
+		default:
+			return;
+		}
+	}
+
+	if (parent != 0) {
+		lp->rlp_state = REBASE_LINKPOOL_SPLIT_FRAGMENT;
+		lp->rlp_anchor = parent;
+	}
+}
+
+/*
+ * Cross-reference phase A driver: classify every linkpool in both
+ * branch tables out of REBASE_LINKPOOL_UNCLASSIFIED, then run the
+ * split-fragment rescue over the novel-looking ones. Base
+ * linkpools are the reference frame and carry no state. The
+ * per-branch tally dbgmsg lines are a stable harness contract.
+ */
+static int
+rebase_anchor_branch(rebase_state_t *rs, objset_t *side_os,
+    const sa_attr_type_t *side_sa, rebase_linkpool_table_t *rlpt,
+    rebase_changelist_t *rcl, uint64_t *tally)
+{
+	rebase_linkpool_t *lp;
+	int err;
+
+	for (lp = avl_first(&rlpt->rlpt_by_obj); lp != NULL;
+	    lp = AVL_NEXT(&rlpt->rlpt_by_obj, lp)) {
+		err = rebase_classify_linkpool(rs, side_os, side_sa,
+		    lp);
+		if (err != 0)
+			return (err);
+
+		if (lp->rlp_state == REBASE_LINKPOOL_NOVEL ||
+		    lp->rlp_state == REBASE_LINKPOOL_RECYCLED)
+			rebase_fragment_rescue(rcl, lp);
+
+		tally[lp->rlp_state]++;
+	}
+	return (0);
+}
+
+static int
+rebase_anchor_linkpools(rebase_state_t *rs)
+{
+	uint64_t tl[REBASE_LINKPOOL_SPLIT_FRAGMENT + 1] = { 0 };
+	uint64_t tr[REBASE_LINKPOOL_SPLIT_FRAGMENT + 1] = { 0 };
+	int err;
+
+	err = rebase_anchor_branch(rs, rs->rs_left_os,
+	    rs->rs_left_sa, &rs->rs_left_linkpools,
+	    &rs->rs_left_changes, tl);
+	if (err == 0)
+		err = rebase_anchor_branch(rs, rs->rs_right_os,
+		    rs->rs_right_sa, &rs->rs_right_linkpools,
+		    &rs->rs_right_changes, tr);
+	if (err != 0) {
+		/*
+		 * Every classified dnode was witnessed by the walk
+		 * on an immutable snapshot; a vanished object or
+		 * attribute is corrupt input, and a raw ENOENT
+		 * would read as "no common ancestor" at the ioctl
+		 * boundary.
+		 */
+		if (err == ENOENT)
+			err = SET_ERROR(EIO);
+		return (err);
+	}
+
+	zfs_dbgmsg("rebase: linkpools left anchored %llu novel %llu "
+	    "recycled %llu fragment %llu",
+	    (u_longlong_t)tl[REBASE_LINKPOOL_ANCHORED],
+	    (u_longlong_t)tl[REBASE_LINKPOOL_NOVEL],
+	    (u_longlong_t)tl[REBASE_LINKPOOL_RECYCLED],
+	    (u_longlong_t)tl[REBASE_LINKPOOL_SPLIT_FRAGMENT]);
+	zfs_dbgmsg("rebase: linkpools right anchored %llu novel %llu "
+	    "recycled %llu fragment %llu",
+	    (u_longlong_t)tr[REBASE_LINKPOOL_ANCHORED],
+	    (u_longlong_t)tr[REBASE_LINKPOOL_NOVEL],
+	    (u_longlong_t)tr[REBASE_LINKPOOL_RECYCLED],
+	    (u_longlong_t)tr[REBASE_LINKPOOL_SPLIT_FRAGMENT]);
+	return (0);
+}
+
+/*
+ * Find or create the membership row for one path. New rows start
+ * with both targets at REBASE_TARGET_SAME_AS_BASE -- "expressed
+ * nothing", which is exactly what an untouched side means -- so a
+ * row created for one branch's change leaves the other branch's
+ * silence encoded correctly.
+ */
+static rebase_ppath_t *
+rebase_ppath_row(rebase_state_t *rs, const char *path,
+    size_t pathlen)
+{
+	rebase_ppath_t key, *rpp;
+	avl_index_t where;
+
+	key.rpp_path = (char *)(uintptr_t)path;
+	rpp = avl_find(&rs->rs_ppaths, &key, &where);
+	if (rpp != NULL)
+		return (rpp);
+
+	rpp = kmem_zalloc(sizeof (*rpp), KM_SLEEP);
+	rpp->rpp_path = kmem_alloc(pathlen, KM_SLEEP);
+	memcpy(rpp->rpp_path, path, pathlen);
+	rpp->rpp_pathlen = pathlen;
+	rpp->rpp_left.rmt_kind = REBASE_TARGET_SAME_AS_BASE;
+	rpp->rpp_right.rmt_kind = REBASE_TARGET_SAME_AS_BASE;
+
+	avl_insert(&rs->rs_ppaths, rpp, where);
+	rs->rs_ppath_count++;
+	return (rpp);
+}
+
+/*
+ * Cross-reference phase B, per path and branch: translate the
+ * branch's state at one path into the branch-independent
+ * membership vocabulary.
+ *
+ * REBASE_TARGET_SAME_AS_BASE is "expressed nothing", never a vote
+ * for base -- that one encoding decision is what lets a lone sever
+ * or delete win in phase D without a conflict or a union. Fragment
+ * members target REBASE_TARGET_FRAGMENT, never ANCHOR(parent):
+ * an ANCHOR(parent) target would let phase D merge them back with
+ * the parent's surviving roster, silently undoing the split.
+ *
+ * "Membership unchanged" is decided against the base linkpool
+ * TABLE (was this path a member of the same lineage in base?),
+ * never against the record's linkpool op -- move-collapse zeroes
+ * the op on collapsed member renames, whose new paths are
+ * nevertheless joins.
+ */
+static void
+rebase_membership_target(rebase_state_t *rs,
+    rebase_changelist_t *rcl, rebase_linkpool_table_t *side_rlpt,
+    const char *path, rebase_mtarget_t *tgt)
+{
+	rebase_change_t *rc;
+	rebase_linkpool_t *lp, *base_lp;
+
+	tgt->rmt_linkpool = 0;
+	tgt->rmt_fragment = 0;
+
+	rc = rebase_change_at(rcl, path);
+	if (rc != NULL && rc->rc_content_op == REBASE_CONTENT_DELETE) {
+		tgt->rmt_kind = REBASE_TARGET_GONE;
+		return;
+	}
+
+	lp = rebase_linkpool_of(side_rlpt, path);
+	base_lp = rebase_linkpool_of(&rs->rs_base_linkpools, path);
+
+	if (lp == NULL) {
+		/*
+		 * Not a member on this branch: severed out of its
+		 * base linkpool, or never linkpool business at all.
+		 */
+		tgt->rmt_kind = (base_lp != NULL) ?
+		    REBASE_TARGET_STANDALONE :
+		    REBASE_TARGET_SAME_AS_BASE;
+		return;
+	}
+
+	switch (lp->rlp_state) {
+	case REBASE_LINKPOOL_ANCHORED:
+		if (base_lp != NULL &&
+		    base_lp->rlp_obj == lp->rlp_anchor) {
+			tgt->rmt_kind = REBASE_TARGET_SAME_AS_BASE;
+		} else {
+			tgt->rmt_kind = REBASE_TARGET_ANCHOR;
+			tgt->rmt_linkpool = lp->rlp_anchor;
+		}
+		break;
+	case REBASE_LINKPOOL_SPLIT_FRAGMENT:
+		tgt->rmt_kind = REBASE_TARGET_FRAGMENT;
+		tgt->rmt_linkpool = lp->rlp_anchor;
+		tgt->rmt_fragment = lp->rlp_obj;
+		break;
+	case REBASE_LINKPOOL_NOVEL:
+	case REBASE_LINKPOOL_RECYCLED:
+		tgt->rmt_kind = REBASE_TARGET_NOVEL;
+		tgt->rmt_linkpool = lp->rlp_obj;
+		break;
+	default:
+		/*
+		 * Phase A classifies every branch linkpool; an
+		 * UNCLASSIFIED one here is an engine bug, not
+		 * input corruption.
+		 */
+		ASSERT3U(lp->rlp_state, !=,
+		    REBASE_LINKPOOL_UNCLASSIFIED);
+		tgt->rmt_kind = REBASE_TARGET_SAME_AS_BASE;
+		break;
+	}
+}
+
+/*
+ * Cross-reference phase B driver: build one membership row per
+ * path appearing in either changelist or either branch linkpool
+ * table, with both branch targets normalized. Purely in-memory.
+ *
+ * The old path of EVERY collapsed move gets a synthesized GONE
+ * row: move-collapse freed its DELETE record, so without the row
+ * the other branch could claim the abandoned name for a linkpool
+ * and win against silence unseen. Member renames need the row to
+ * take the old name off the parent roster; standalone move
+ * sources need it so a pool claim at the old name meets a real
+ * GONE and contests like any delete (seam cell X-C). Fully
+ * standalone old paths gain rows whose lone GONE merges silently.
+ * GONE is written directly -- recomputing the target at the old
+ * path would read "absent branch linkpool, base member" as a
+ * sever.
+ */
+static void
+rebase_membership_branch(rebase_state_t *rs,
+    rebase_changelist_t *rcl, rebase_linkpool_table_t *side_rlpt,
+    boolean_t is_left)
+{
+	rebase_change_t *rc;
+	rebase_linkpool_link_t *link;
+	rebase_ppath_t *rpp;
+
+	for (rc = avl_first(&rcl->rcl_by_path); rc != NULL;
+	    rc = AVL_NEXT(&rcl->rcl_by_path, rc)) {
+		rpp = rebase_ppath_row(rs, rc->rc_path,
+		    rc->rc_pathlen);
+		rebase_membership_target(rs, rcl, side_rlpt,
+		    rc->rc_path, is_left ? &rpp->rpp_left :
+		    &rpp->rpp_right);
+
+		if (rc->rc_content_op == REBASE_CONTENT_MOVE ||
+		    rc->rc_content_op == REBASE_CONTENT_MOVE_EDIT) {
+			rebase_mtarget_t *tgt;
+
+			rpp = rebase_ppath_row(rs, rc->rc_old_path,
+			    rc->rc_old_pathlen);
+			tgt = is_left ? &rpp->rpp_left :
+			    &rpp->rpp_right;
+			tgt->rmt_kind = REBASE_TARGET_GONE;
+			tgt->rmt_linkpool = 0;
+			tgt->rmt_fragment = 0;
+		}
+	}
+
+	for (link = avl_first(&side_rlpt->rlpt_by_path);
+	    link != NULL;
+	    link = AVL_NEXT(&side_rlpt->rlpt_by_path, link)) {
+		rpp = rebase_ppath_row(rs, link->rlpl_path,
+		    link->rlpl_pathlen);
+		rebase_membership_target(rs, rcl, side_rlpt,
+		    link->rlpl_path, is_left ? &rpp->rpp_left :
+		    &rpp->rpp_right);
+	}
+}
+
+static void
+rebase_membership_targets(rebase_state_t *rs)
+{
+	uint64_t tl[REBASE_TARGET_NOVEL + 1] = { 0 };
+	uint64_t tr[REBASE_TARGET_NOVEL + 1] = { 0 };
+	rebase_ppath_t *rpp;
+
+	rebase_membership_branch(rs, &rs->rs_left_changes,
+	    &rs->rs_left_linkpools, B_TRUE);
+	rebase_membership_branch(rs, &rs->rs_right_changes,
+	    &rs->rs_right_linkpools, B_FALSE);
+
+	for (rpp = avl_first(&rs->rs_ppaths); rpp != NULL;
+	    rpp = AVL_NEXT(&rs->rs_ppaths, rpp)) {
+		tl[rpp->rpp_left.rmt_kind]++;
+		tr[rpp->rpp_right.rmt_kind]++;
+	}
+
+	zfs_dbgmsg("rebase: targets left same %llu gone %llu "
+	    "standalone %llu anchor %llu fragment %llu novel %llu",
+	    (u_longlong_t)tl[REBASE_TARGET_SAME_AS_BASE],
+	    (u_longlong_t)tl[REBASE_TARGET_GONE],
+	    (u_longlong_t)tl[REBASE_TARGET_STANDALONE],
+	    (u_longlong_t)tl[REBASE_TARGET_ANCHOR],
+	    (u_longlong_t)tl[REBASE_TARGET_FRAGMENT],
+	    (u_longlong_t)tl[REBASE_TARGET_NOVEL]);
+	zfs_dbgmsg("rebase: targets right same %llu gone %llu "
+	    "standalone %llu anchor %llu fragment %llu novel %llu",
+	    (u_longlong_t)tr[REBASE_TARGET_SAME_AS_BASE],
+	    (u_longlong_t)tr[REBASE_TARGET_GONE],
+	    (u_longlong_t)tr[REBASE_TARGET_STANDALONE],
+	    (u_longlong_t)tr[REBASE_TARGET_ANCHOR],
+	    (u_longlong_t)tr[REBASE_TARGET_FRAGMENT],
+	    (u_longlong_t)tr[REBASE_TARGET_NOVEL]);
 }
 
 int
@@ -2477,11 +2966,19 @@ dsl_rebase(const char *left_ds, const char *right_ds, nvlist_t *outnvl)
 	/* Walk the trees and build the linkpool tables. */
 	err = rebase_walk(&state);
 
+	/* Cross-reference phase A: anchor branch linkpools. */
+	if (err == 0)
+		err = rebase_anchor_linkpools(&state);
+
+	/* Phase B: normalize per-path membership targets. */
+	if (err == 0)
+		rebase_membership_targets(&state);
+
 	/*
-	 * Walk, classification, and move-collapse complete.
-	 * Subsequent issues fill in the cross-reference, emit, and
-	 * apply phases here; until they land, a successful diff
-	 * still exits with ENOSYS.
+	 * Diff pipeline complete through cross-reference phase B.
+	 * Subsequent issues fill in phases C-F, emit, and apply
+	 * here; until they land, a successful diff still exits
+	 * with ENOSYS.
 	 */
 	if (err == 0)
 		err = SET_ERROR(ENOSYS);
