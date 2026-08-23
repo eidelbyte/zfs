@@ -730,6 +730,10 @@ typedef struct rebase_walk_ctx {
 	uint64_t	rwc_nhysterical_left;
 	uint64_t	rwc_nhysterical_right;
 	uint64_t	rwc_nlinked;
+	uint64_t	rwc_nmoves_left;
+	uint64_t	rwc_nmoves_right;
+	uint64_t	rwc_nmove_edits_left;
+	uint64_t	rwc_nmove_edits_right;
 } rebase_walk_ctx_t;
 
 /*
@@ -2052,9 +2056,245 @@ rebase_walk_dir(rebase_walk_ctx_t *rwc, uint64_t left_dir,
 }
 
 /*
+ * Length of the common byte prefix of two paths. Used only as the
+ * move-source selection tiebreak, never as a correctness input.
+ */
+static size_t
+rebase_path_prefix_len(const char *a, const char *b)
+{
+	size_t n = 0;
+
+	while (a[n] != '\0' && a[n] == b[n])
+		n++;
+	return (n);
+}
+
+/*
+ * Does the object number carry the same lineage in base and in the
+ * side? A move-collapse run guarantees both dnodes exist (the ADD
+ * witnessed the side's, the DELETE witnessed base's), so this is
+ * the recycling guard and nothing else.
+ */
+static int
+rebase_move_gen_match(rebase_walk_ctx_t *rwc, int side_slot,
+    uint64_t obj, boolean_t *samep)
+{
+	sa_handle_t *hdl_base, *hdl_side;
+	int err;
+
+	err = sa_handle_get(rwc->rwc_os[REBASE_WALK_BASE], obj, NULL,
+	    SA_HDL_PRIVATE, &hdl_base);
+	if (err != 0)
+		return (err);
+	err = sa_handle_get(rwc->rwc_os[side_slot], obj, NULL,
+	    SA_HDL_PRIVATE, &hdl_side);
+	if (err != 0) {
+		sa_handle_destroy(hdl_base);
+		return (err);
+	}
+	err = rebase_same_gen(hdl_base, rwc->rwc_sa[REBASE_WALK_BASE],
+	    hdl_side, rwc->rwc_sa[side_slot], samep);
+	sa_handle_destroy(hdl_side);
+	sa_handle_destroy(hdl_base);
+	return (err);
+}
+
+/*
+ * Collapse one same-object run of changelist records: every
+ * REBASE_CONTENT_ADD that can legally pair with a DELETE in the run
+ * becomes one REBASE_CONTENT_MOVE (or MOVE_EDIT) record. The run
+ * array exists because DELETEs are freed mid-run and AVL iteration
+ * would walk freed memory; consumed slots are NULLed.
+ *
+ * Both gates are per-run constants, not per-pair: the gen match
+ * compares base's obj against the side's obj (recycled index means
+ * nothing here is a move), and the MOVE-vs-MOVE_EDIT content
+ * compare does the same regardless of which paths pair. The gen
+ * gate must run before any content compare -- rebase_is_hysterical
+ * reports a gen mismatch as plain "not identical", which would
+ * misread a recycled index as MOVE_EDIT.
+ *
+ * The linkpool guard admits exactly two pair shapes: both records
+ * NONE (standalone rename), or DELETE REMOVED(from) meeting ADD
+ * ADDED(to) on the run's own linkpool (a member path renamed, one
+ * link out and one link in on the same dnode -- refcount neutral).
+ * Anything else is a genuine membership change riding alongside a
+ * genuine add or delete, and must reach cross-reference intact.
+ * The collapsed record's linkpool axis is NONE in both shapes: the
+ * moved path's membership is unchanged vs base, and the linkpool
+ * tables still carry both rosters.
+ *
+ * Source selection among eligible DELETEs is by longest common
+ * path prefix with the ADD (ties keep the first in sort order) --
+ * a reporting tiebreak only; it never changes whether a collapse
+ * happens.
+ */
+static int
+rebase_move_collapse_run(rebase_walk_ctx_t *rwc, int side_slot,
+    rebase_changelist_t *rcl, rebase_change_t **run, uint_t nrun)
+{
+	uint64_t obj = run[0]->rc_obj;
+	boolean_t same, content_known = B_FALSE;
+	boolean_t content_same = B_FALSE;
+	int err;
+
+	err = rebase_move_gen_match(rwc, side_slot, obj, &same);
+	if (err != 0)
+		return (err);
+	if (!same)
+		return (0);
+
+	for (uint_t i = 0; i < nrun; i++) {
+		rebase_change_t *add = run[i], *best = NULL;
+		size_t bestlen = 0;
+		uint_t bestj = 0;
+
+		if (add == NULL ||
+		    add->rc_content_op != REBASE_CONTENT_ADD)
+			continue;
+
+		for (uint_t j = 0; j < nrun; j++) {
+			rebase_change_t *del = run[j];
+			size_t plen;
+
+			if (del == NULL ||
+			    del->rc_content_op != REBASE_CONTENT_DELETE)
+				continue;
+			if (!((del->rc_linkpool_op ==
+			    REBASE_LINKPOOL_NONE &&
+			    add->rc_linkpool_op ==
+			    REBASE_LINKPOOL_NONE) ||
+			    (del->rc_linkpool_op ==
+			    REBASE_LINKPOOL_REMOVED &&
+			    add->rc_linkpool_op ==
+			    REBASE_LINKPOOL_ADDED &&
+			    del->rc_linkpool_from ==
+			    add->rc_linkpool_to)))
+				continue;
+
+			plen = rebase_path_prefix_len(add->rc_path,
+			    del->rc_path);
+			if (best == NULL || plen > bestlen) {
+				best = del;
+				bestlen = plen;
+				bestj = j;
+			}
+		}
+		if (best == NULL)
+			continue;
+
+		if (!content_known) {
+			err = rebase_is_hysterical(rwc,
+			    REBASE_WALK_BASE, obj, side_slot, obj,
+			    B_TRUE, &content_same);
+			if (err != 0)
+				return (err);
+			content_known = B_TRUE;
+		}
+
+		add->rc_content_op = content_same ?
+		    REBASE_CONTENT_MOVE : REBASE_CONTENT_MOVE_EDIT;
+		add->rc_linkpool_op = REBASE_LINKPOOL_NONE;
+		add->rc_linkpool_from = 0;
+		add->rc_linkpool_to = 0;
+		add->rc_old_path = best->rc_path;
+		add->rc_old_pathlen = best->rc_pathlen;
+		best->rc_path = NULL;
+
+		avl_remove(&rcl->rcl_by_path, best);
+		avl_remove(&rcl->rcl_by_obj, best);
+		kmem_free(best, sizeof (*best));
+		run[bestj] = NULL;
+		rcl->rcl_count--;
+
+		if (content_same) {
+			if (side_slot == REBASE_WALK_LEFT)
+				rwc->rwc_nmoves_left++;
+			else
+				rwc->rwc_nmoves_right++;
+		} else {
+			if (side_slot == REBASE_WALK_LEFT)
+				rwc->rwc_nmove_edits_left++;
+			else
+				rwc->rwc_nmove_edits_right++;
+		}
+	}
+
+	return (0);
+}
+
+/*
+ * The move-collapse phase for one side's changelist: walk
+ * rcl_by_obj, where same-object records sort adjacent, and collapse
+ * every eligible ADD+DELETE pair into a MOVE. Runs inside the walk
+ * context because the gen and content gates reuse the walk's SA
+ * tables and comparison tiers. Only DELETE records are ever freed,
+ * so the saved next-run pointer (a different object by definition)
+ * stays valid across a run's surgery.
+ */
+static int
+rebase_move_collapse(rebase_walk_ctx_t *rwc, int side_slot,
+    rebase_changelist_t *rcl)
+{
+	avl_tree_t *t = &rcl->rcl_by_obj;
+	rebase_change_t *rc, *next;
+	int err;
+
+	rc = avl_first(t);
+	while (rc != NULL) {
+		uint64_t obj = rc->rc_obj;
+		rebase_change_t *p;
+		boolean_t has_add = B_FALSE, has_del = B_FALSE;
+		uint_t nrun = 0;
+
+		for (p = rc; p != NULL && p->rc_obj == obj;
+		    p = AVL_NEXT(t, p)) {
+			if (p->rc_content_op == REBASE_CONTENT_ADD)
+				has_add = B_TRUE;
+			else if (p->rc_content_op ==
+			    REBASE_CONTENT_DELETE)
+				has_del = B_TRUE;
+			nrun++;
+		}
+		next = p;
+
+		if (has_add && has_del) {
+			rebase_change_t **run;
+			uint_t i = 0;
+
+			run = kmem_alloc(nrun * sizeof (*run),
+			    KM_SLEEP);
+			for (p = rc; p != next; p = AVL_NEXT(t, p))
+				run[i++] = p;
+			err = rebase_move_collapse_run(rwc,
+			    side_slot, rcl, run, nrun);
+			kmem_free(run, nrun * sizeof (*run));
+			if (err != 0) {
+				/*
+				 * Both dnodes were witnessed by the
+				 * walk on immutable snapshots, so a
+				 * vanished object here is corrupt
+				 * input -- and a raw ENOENT would
+				 * read as "no common ancestor" at
+				 * the ioctl boundary.
+				 */
+				if (err == ENOENT)
+					err = SET_ERROR(EIO);
+				return (err);
+			}
+		}
+		rc = next;
+	}
+
+	return (0);
+}
+
+/*
  * The walk phase: set up SA on the three read sources, walk the
- * union of the trees from the roots, and verify linkpool
- * completeness on all three tables.
+ * union of the trees from the roots, verify linkpool completeness
+ * on all three tables, then collapse rename pairs into moves. The
+ * changelists dbgmsg line reports post-collapse counts: what this
+ * phase hands to cross-reference.
  */
 static int
 rebase_walk(rebase_state_t *rs)
@@ -2096,6 +2336,13 @@ rebase_walk(rebase_state_t *rs)
 		err = rebase_linkpool_table_verify(
 		    &rs->rs_right_linkpools);
 
+	if (err == 0)
+		err = rebase_move_collapse(&rwc, REBASE_WALK_LEFT,
+		    &rs->rs_left_changes);
+	if (err == 0)
+		err = rebase_move_collapse(&rwc, REBASE_WALK_RIGHT,
+		    &rs->rs_right_changes);
+
 	if (err == 0) {
 		zfs_dbgmsg("rebase: walk visited %llu paths, "
 		    "hysterical left %llu right %llu, "
@@ -2107,6 +2354,12 @@ rebase_walk(rebase_state_t *rs)
 		zfs_dbgmsg("rebase: changelists left %u right %u",
 		    rs->rs_left_changes.rcl_count,
 		    rs->rs_right_changes.rcl_count);
+		zfs_dbgmsg("rebase: moves left %llu right %llu, "
+		    "move-edits left %llu right %llu",
+		    (u_longlong_t)rwc.rwc_nmoves_left,
+		    (u_longlong_t)rwc.rwc_nmoves_right,
+		    (u_longlong_t)rwc.rwc_nmove_edits_left,
+		    (u_longlong_t)rwc.rwc_nmove_edits_right);
 	}
 
 	return (err);
@@ -2225,10 +2478,10 @@ dsl_rebase(const char *left_ds, const char *right_ds, nvlist_t *outnvl)
 	err = rebase_walk(&state);
 
 	/*
-	 * Walk complete.  Subsequent issues fill in the diff
-	 * classification, cross-reference, emit, and apply phases
-	 * here; until they land, a successful walk still exits
-	 * with ENOSYS.
+	 * Walk, classification, and move-collapse complete.
+	 * Subsequent issues fill in the cross-reference, emit, and
+	 * apply phases here; until they land, a successful diff
+	 * still exits with ENOSYS.
 	 */
 	if (err == 0)
 		err = SET_ERROR(ENOSYS);
