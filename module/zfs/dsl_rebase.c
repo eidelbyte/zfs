@@ -245,6 +245,8 @@ rebase_ppath_cmp(const void *a, const void *b)
 }
 
 static int rebase_sa_setup(objset_t *os, sa_attr_type_t **sa_tblp);
+static void rebase_manifest_init(rebase_manifest_t *rm);
+static void rebase_manifest_fini(rebase_manifest_t *rm);
 
 static void
 rebase_changelist_init(rebase_changelist_t *rcl)
@@ -680,6 +682,7 @@ rebase_state_setup(rebase_state_t *rs, objset_t *left_snap_os,
 	    sizeof (rebase_ppath_t), offsetof(rebase_ppath_t,
 	    rpp_avl));
 	rs->rs_ppath_count = 0;
+	rebase_manifest_init(&rs->rs_manifest);
 
 	return (0);
 }
@@ -697,6 +700,7 @@ rebase_state_teardown(rebase_state_t *rs)
 	}
 	avl_destroy(&rs->rs_ppaths);
 	rs->rs_ppath_count = 0;
+	rebase_manifest_fini(&rs->rs_manifest);
 
 	rebase_linkpool_table_fini(&rs->rs_right_linkpools);
 	rebase_linkpool_table_fini(&rs->rs_left_linkpools);
@@ -2854,6 +2858,1002 @@ rebase_membership_targets(rebase_state_t *rs)
 	    (u_longlong_t)tr[REBASE_TARGET_NOVEL]);
 }
 
+static void
+rebase_manifest_init(rebase_manifest_t *rm)
+{
+	list_create(&rm->rm_conflicts, sizeof (rebase_conflict_t),
+	    offsetof(rebase_conflict_t, rcf_node));
+	list_create(&rm->rm_warnings, sizeof (rebase_warning_t),
+	    offsetof(rebase_warning_t, rw_node));
+	list_create(&rm->rm_actions, sizeof (rebase_action_t),
+	    offsetof(rebase_action_t, ra_node));
+	rm->rm_nconflicts = 0;
+	rm->rm_nwarnings = 0;
+	rm->rm_nactions = 0;
+}
+
+static void
+rebase_manifest_fini(rebase_manifest_t *rm)
+{
+	rebase_conflict_t *rcf;
+
+	while ((rcf = list_remove_head(&rm->rm_conflicts)) != NULL) {
+		for (uint_t i = 0; i < rcf->rcf_nalt; i++) {
+			kmem_free(rcf->rcf_alt_paths[i],
+			    strlen(rcf->rcf_alt_paths[i]) + 1);
+		}
+		if (rcf->rcf_nalt > 0) {
+			kmem_free(rcf->rcf_alt_paths,
+			    rcf->rcf_nalt * sizeof (char *));
+		}
+		kmem_free(rcf->rcf_path, rcf->rcf_pathlen);
+		kmem_free(rcf, sizeof (*rcf));
+	}
+	list_destroy(&rm->rm_conflicts);
+	list_destroy(&rm->rm_warnings);
+	list_destroy(&rm->rm_actions);
+	rm->rm_nconflicts = 0;
+	rm->rm_nwarnings = 0;
+	rm->rm_nactions = 0;
+}
+
+/*
+ * Record one conflict, deduplicated on the (rcf_obj, rcf_type)
+ * pair: the first path becomes the record's primary path, every
+ * further same-key path lands in rcf_alt_paths. Two conflicts of
+ * different types on one object stay two records, and alt paths
+ * only ever merge same-type conflicts -- the retrospective-2
+ * dedup rule, now the manifest v2 contract. The list is scanned
+ * linearly: conflicts are rare by construction, records rarer
+ * still after dedup.
+ */
+static void
+rebase_conflict_add(rebase_state_t *rs, rebase_conflict_type_t type,
+    uint64_t obj, const char *path, size_t pathlen)
+{
+	rebase_manifest_t *rm = &rs->rs_manifest;
+	rebase_conflict_t *rcf;
+	char **na, *copy;
+
+	for (rcf = list_head(&rm->rm_conflicts); rcf != NULL;
+	    rcf = list_next(&rm->rm_conflicts, rcf)) {
+		if (rcf->rcf_type == type && rcf->rcf_obj == obj)
+			break;
+	}
+
+	if (rcf == NULL) {
+		rcf = kmem_zalloc(sizeof (*rcf), KM_SLEEP);
+		rcf->rcf_type = type;
+		rcf->rcf_obj = obj;
+		rcf->rcf_path = kmem_alloc(pathlen, KM_SLEEP);
+		memcpy(rcf->rcf_path, path, pathlen);
+		rcf->rcf_pathlen = pathlen;
+		list_insert_tail(&rm->rm_conflicts, rcf);
+		rm->rm_nconflicts++;
+		return;
+	}
+
+	if (strcmp(rcf->rcf_path, path) == 0)
+		return;
+	for (uint_t i = 0; i < rcf->rcf_nalt; i++) {
+		if (strcmp(rcf->rcf_alt_paths[i], path) == 0)
+			return;
+	}
+
+	copy = kmem_alloc(pathlen, KM_SLEEP);
+	memcpy(copy, path, pathlen);
+	na = kmem_alloc((rcf->rcf_nalt + 1) * sizeof (char *),
+	    KM_SLEEP);
+	if (rcf->rcf_nalt > 0) {
+		memcpy(na, rcf->rcf_alt_paths,
+		    rcf->rcf_nalt * sizeof (char *));
+		kmem_free(rcf->rcf_alt_paths,
+		    rcf->rcf_nalt * sizeof (char *));
+	}
+	na[rcf->rcf_nalt] = copy;
+	rcf->rcf_alt_paths = na;
+	rcf->rcf_nalt++;
+}
+
+static rebase_ppath_t *
+rebase_ppath_find(rebase_state_t *rs, const char *path)
+{
+	rebase_ppath_t key;
+
+	key.rpp_path = (char *)(uintptr_t)path;
+	return (avl_find(&rs->rs_ppaths, &key, NULL));
+}
+
+static boolean_t
+rebase_mtarget_equal(const rebase_mtarget_t *a,
+    const rebase_mtarget_t *b)
+{
+	return (a->rmt_kind == b->rmt_kind &&
+	    a->rmt_linkpool == b->rmt_linkpool &&
+	    a->rmt_fragment == b->rmt_fragment);
+}
+
+/*
+ * Does this side's changelist carry a content change for the given
+ * object? EDIT and MOVE_EDIT both qualify; ADD/DELETE and
+ * linkpool-only records do not. Probes rcl_by_obj with a zero-path
+ * key and walks the object's run.
+ */
+static boolean_t
+rebase_side_edits_obj(rebase_changelist_t *rcl, uint64_t obj)
+{
+	rebase_change_t key, *rc;
+	avl_index_t where;
+
+	key.rc_obj = obj;
+	key.rc_path = (char *)(uintptr_t)"";
+
+	rc = avl_find(&rcl->rcl_by_obj, &key, &where);
+	if (rc == NULL)
+		rc = avl_nearest(&rcl->rcl_by_obj, where, AVL_AFTER);
+	for (; rc != NULL && rc->rc_obj == obj;
+	    rc = AVL_NEXT(&rcl->rcl_by_obj, rc)) {
+		if (rc->rc_content_op == REBASE_CONTENT_EDIT ||
+		    rc->rc_content_op == REBASE_CONTENT_MOVE_EDIT)
+			return (B_TRUE);
+	}
+	return (B_FALSE);
+}
+
+/*
+ * Phase C's unification bookkeeping. Unified ids are SYNTHETIC --
+ * the top bit set over a counter -- so they can never collide with
+ * an object number (dirents cap objects at 48 bits) on either
+ * side. Raw pool objects remain the ids of pools phase C never
+ * touches. A shared row means path overlap and every overlapping
+ * pair is processed here, but processing only REWRITES ids on
+ * unification -- the conflict path leaves both raw ids in place,
+ * and clones allocate object numbers in lockstep, so raw ids
+ * routinely collide numerically ACROSS sides. Phase D therefore
+ * treats both-NOVEL id equality as agreement only when the id is
+ * synthetic (REBASE_ID_IS_UNIFIED); everywhere else raw ids are
+ * compared only against ids from the same objset. The map
+ * remembers which pools joined which unified group; relabeling
+ * always walks a pool's own member links, so it is side-scoped by
+ * construction and never sweeps the row table.
+ */
+#define	REBASE_UNIFIED_ID(n)	((1ULL << 63) | (n))
+#define	REBASE_ID_IS_UNIFIED(id)	(((id) & (1ULL << 63)) != 0)
+
+typedef struct rebase_unify_entry {
+	int			rue_side;	/* REBASE_WALK_* */
+	uint64_t		rue_obj;	/* branch pool obj */
+	rebase_linkpool_t	*rue_lp;
+	uint64_t		rue_uid;
+	avl_node_t		rue_avl;
+} rebase_unify_entry_t;
+
+static int
+rebase_unify_cmp(const void *a, const void *b)
+{
+	const rebase_unify_entry_t *ua = a;
+	const rebase_unify_entry_t *ub = b;
+	int cmp;
+
+	cmp = TREE_CMP(ua->rue_side, ub->rue_side);
+	if (cmp != 0)
+		return (cmp);
+	return (TREE_CMP(ua->rue_obj, ub->rue_obj));
+}
+
+typedef struct rebase_merge_ctx {
+	rebase_state_t		*rmc_rs;
+	rebase_walk_ctx_t	rmc_rwc;	/* for data compares */
+	avl_tree_t		rmc_umap;
+	uint64_t		rmc_next_uid;
+} rebase_merge_ctx_t;
+
+static rebase_unify_entry_t *
+rebase_unify_find(rebase_merge_ctx_t *ctx, int side, uint64_t obj)
+{
+	rebase_unify_entry_t key;
+
+	key.rue_side = side;
+	key.rue_obj = obj;
+	return (avl_find(&ctx->rmc_umap, &key, NULL));
+}
+
+static void
+rebase_unify_set(rebase_merge_ctx_t *ctx, int side,
+    rebase_linkpool_t *lp, uint64_t uid)
+{
+	rebase_unify_entry_t *rue;
+
+	rue = rebase_unify_find(ctx, side, lp->rlp_obj);
+	if (rue == NULL) {
+		rue = kmem_zalloc(sizeof (*rue), KM_SLEEP);
+		rue->rue_side = side;
+		rue->rue_obj = lp->rlp_obj;
+		rue->rue_lp = lp;
+		avl_add(&ctx->rmc_umap, rue);
+	}
+	rue->rue_uid = uid;
+}
+
+/*
+ * Rewrite one pool's member rows on one side: NOVEL relabels the
+ * id in rmt_linkpool, FRAGMENT relabels the fragment id in
+ * rmt_fragment (the parent lineage in rmt_linkpool is untouched).
+ */
+static void
+rebase_relabel_pool(rebase_state_t *rs, rebase_linkpool_t *lp,
+    int side, rebase_mtarget_kind_t kind, uint64_t from, uint64_t to)
+{
+	rebase_linkpool_link_t *link;
+
+	for (link = list_head(&lp->rlp_links); link != NULL;
+	    link = list_next(&lp->rlp_links, link)) {
+		rebase_ppath_t *rpp;
+		rebase_mtarget_t *tgt;
+
+		rpp = rebase_ppath_find(rs, link->rlpl_path);
+		if (rpp == NULL)
+			continue;
+		tgt = (side == REBASE_WALK_LEFT) ? &rpp->rpp_left :
+		    &rpp->rpp_right;
+		if (tgt->rmt_kind != kind)
+			continue;
+		if (kind == REBASE_TARGET_NOVEL &&
+		    tgt->rmt_linkpool == from)
+			tgt->rmt_linkpool = to;
+		else if (kind == REBASE_TARGET_FRAGMENT &&
+		    tgt->rmt_fragment == from)
+			tgt->rmt_fragment = to;
+	}
+}
+
+/*
+ * Unify one overlapping (left pool, right pool) pair into a shared
+ * id, chaining through groups either pool may already belong to.
+ * check_data runs the side-vs-side content tiers first (the novel
+ * heuristic); on mismatch nothing is rewritten and *unifiedp comes
+ * back false so the caller can emit the overlap conflict. Content
+ * identity is transitive, so pairwise chaining into groups is
+ * sound.
+ */
+static int
+rebase_unify_pair(rebase_merge_ctx_t *ctx, rebase_linkpool_t *llp,
+    rebase_linkpool_t *rlp, rebase_mtarget_kind_t kind,
+    boolean_t check_data, boolean_t *unifiedp)
+{
+	rebase_state_t *rs = ctx->rmc_rs;
+	rebase_unify_entry_t *ul, *ur;
+	uint64_t uid;
+	int err;
+
+	*unifiedp = B_TRUE;
+
+	ul = rebase_unify_find(ctx, REBASE_WALK_LEFT, llp->rlp_obj);
+	ur = rebase_unify_find(ctx, REBASE_WALK_RIGHT, rlp->rlp_obj);
+	if (ul != NULL && ur != NULL && ul->rue_uid == ur->rue_uid)
+		return (0);
+
+	if (check_data) {
+		boolean_t same;
+
+		err = rebase_is_hysterical(&ctx->rmc_rwc,
+		    REBASE_WALK_LEFT, llp->rlp_obj,
+		    REBASE_WALK_RIGHT, rlp->rlp_obj, B_FALSE, &same);
+		if (err != 0)
+			return (err);
+		if (!same) {
+			*unifiedp = B_FALSE;
+			return (0);
+		}
+	}
+
+	if (ul == NULL && ur == NULL) {
+		uid = REBASE_UNIFIED_ID(ctx->rmc_next_uid++);
+		rebase_relabel_pool(rs, llp, REBASE_WALK_LEFT, kind,
+		    llp->rlp_obj, uid);
+		rebase_relabel_pool(rs, rlp, REBASE_WALK_RIGHT, kind,
+		    rlp->rlp_obj, uid);
+		rebase_unify_set(ctx, REBASE_WALK_LEFT, llp, uid);
+		rebase_unify_set(ctx, REBASE_WALK_RIGHT, rlp, uid);
+	} else if (ul != NULL && ur == NULL) {
+		rebase_relabel_pool(rs, rlp, REBASE_WALK_RIGHT, kind,
+		    rlp->rlp_obj, ul->rue_uid);
+		rebase_unify_set(ctx, REBASE_WALK_RIGHT, rlp,
+		    ul->rue_uid);
+	} else if (ul == NULL && ur != NULL) {
+		rebase_relabel_pool(rs, llp, REBASE_WALK_LEFT, kind,
+		    llp->rlp_obj, ur->rue_uid);
+		rebase_unify_set(ctx, REBASE_WALK_LEFT, llp,
+		    ur->rue_uid);
+	} else {
+		/*
+		 * Both pools already belong to groups; merge the
+		 * right pool's group into the left pool's by
+		 * relabeling every member pool of the losing group.
+		 */
+		rebase_unify_entry_t *rue;
+		uint64_t lose = ur->rue_uid, win = ul->rue_uid;
+
+		for (rue = avl_first(&ctx->rmc_umap); rue != NULL;
+		    rue = AVL_NEXT(&ctx->rmc_umap, rue)) {
+			if (rue->rue_uid != lose)
+				continue;
+			rebase_relabel_pool(rs, rue->rue_lp,
+			    rue->rue_side, kind, lose, win);
+			rue->rue_uid = win;
+		}
+	}
+	return (0);
+}
+
+/*
+ * Collect the distinct right-branch pools whose rosters overlap
+ * one left pool's, by probing each member path into the right
+ * table's reverse index -- O(member paths x log), never all-pairs
+ * (retrospective-3 iceberg 8). Owners are filtered to the two
+ * given states, and to a matching parent anchor when the caller
+ * passes one (fragment matching stays within a parent; pass 0 to
+ * accept any).
+ */
+static uint_t
+rebase_overlap_owners(rebase_state_t *rs, rebase_linkpool_t *llp,
+    rebase_linkpool_state_t s1, rebase_linkpool_state_t s2,
+    uint64_t match_anchor, rebase_linkpool_t **owners, uint_t max)
+{
+	rebase_linkpool_link_t *link;
+	uint_t n = 0;
+
+	for (link = list_head(&llp->rlp_links); link != NULL;
+	    link = list_next(&llp->rlp_links, link)) {
+		rebase_linkpool_t *rlp;
+		uint_t i;
+
+		rlp = rebase_linkpool_of(&rs->rs_right_linkpools,
+		    link->rlpl_path);
+		if (rlp == NULL ||
+		    (rlp->rlp_state != s1 && rlp->rlp_state != s2))
+			continue;
+		if (match_anchor != 0 &&
+		    rlp->rlp_anchor != match_anchor)
+			continue;
+		for (i = 0; i < n; i++) {
+			if (owners[i] == rlp)
+				break;
+		}
+		if (i == n && n < max)
+			owners[n++] = rlp;
+	}
+	return (n);
+}
+
+/*
+ * Phase C, first pass: fragment correspondence. Provenance-based
+ * and unconditional -- no data check -- but only across fragments
+ * of the SAME parent with roster overlap. Overlap is required even
+ * in the one-fragment-per-branch case: two branches severing
+ * disjoint path sets out of one parent expressed two separate
+ * splits, and merging them would create sharing neither side asked
+ * for (rule 5; doc note 2026-08-23). Zero-overlap fragments simply
+ * never share a row, so phase D never compares their ids.
+ */
+static void
+rebase_unify_fragments(rebase_merge_ctx_t *ctx)
+{
+	rebase_state_t *rs = ctx->rmc_rs;
+	rebase_linkpool_t *llp;
+
+	for (llp = avl_first(&rs->rs_left_linkpools.rlpt_by_obj);
+	    llp != NULL;
+	    llp = AVL_NEXT(&rs->rs_left_linkpools.rlpt_by_obj, llp)) {
+		rebase_linkpool_t **owners;
+		uint_t n;
+
+		if (llp->rlp_state != REBASE_LINKPOOL_SPLIT_FRAGMENT)
+			continue;
+
+		owners = kmem_alloc(llp->rlp_nfound *
+		    sizeof (*owners), KM_SLEEP);
+		n = rebase_overlap_owners(rs, llp,
+		    REBASE_LINKPOOL_SPLIT_FRAGMENT,
+		    REBASE_LINKPOOL_SPLIT_FRAGMENT, llp->rlp_anchor,
+		    owners, llp->rlp_nfound);
+		for (uint_t i = 0; i < n; i++) {
+			boolean_t u;
+
+			(void) rebase_unify_pair(ctx, llp, owners[i],
+			    REBASE_TARGET_FRAGMENT, B_FALSE, &u);
+		}
+		kmem_free(owners, llp->rlp_nfound * sizeof (*owners));
+	}
+}
+
+/*
+ * Phase C, second pass: novel-novel correspondence, the engine's
+ * only heuristic. Overlapping post-fork pools with identical
+ * content unify (both sides said "these paths share THIS data");
+ * overlapping pools with different content are
+ * REBASE_CONFLICT_NOVEL_LINKPOOL_OVERLAP scoped to exactly the
+ * overlapping paths. Zero-overlap pools stay separate even with
+ * identical data: content is not evidence of shared intent.
+ */
+static int
+rebase_unify_novels(rebase_merge_ctx_t *ctx)
+{
+	rebase_state_t *rs = ctx->rmc_rs;
+	rebase_linkpool_t *llp;
+	int err = 0;
+
+	for (llp = avl_first(&rs->rs_left_linkpools.rlpt_by_obj);
+	    llp != NULL;
+	    llp = AVL_NEXT(&rs->rs_left_linkpools.rlpt_by_obj, llp)) {
+		rebase_linkpool_t **owners;
+		uint_t n;
+
+		if (llp->rlp_state != REBASE_LINKPOOL_NOVEL &&
+		    llp->rlp_state != REBASE_LINKPOOL_RECYCLED)
+			continue;
+
+		owners = kmem_alloc(llp->rlp_nfound *
+		    sizeof (*owners), KM_SLEEP);
+		n = rebase_overlap_owners(rs, llp,
+		    REBASE_LINKPOOL_NOVEL, REBASE_LINKPOOL_RECYCLED,
+		    0, owners, llp->rlp_nfound);
+
+		for (uint_t i = 0; i < n && err == 0; i++) {
+			rebase_unify_entry_t *ul;
+			rebase_linkpool_link_t *link;
+			uint64_t key;
+			boolean_t u;
+
+			err = rebase_unify_pair(ctx, llp, owners[i],
+			    REBASE_TARGET_NOVEL, B_TRUE, &u);
+			if (err != 0 || u)
+				continue;
+
+			/*
+			 * Different content claiming the same
+			 * paths: conflict, scoped to the overlap,
+			 * keyed by the left group's identity.
+			 */
+			ul = rebase_unify_find(ctx, REBASE_WALK_LEFT,
+			    llp->rlp_obj);
+			key = (ul != NULL) ? ul->rue_uid :
+			    llp->rlp_obj;
+			for (link = list_head(&llp->rlp_links);
+			    link != NULL;
+			    link = list_next(&llp->rlp_links, link)) {
+				if (rebase_linkpool_of(
+				    &rs->rs_right_linkpools,
+				    link->rlpl_path) != owners[i])
+					continue;
+				rebase_conflict_add(rs,
+				    REBASE_CONFLICT_NOVEL_LINKPOOL_OVERLAP,
+				    key, link->rlpl_path,
+				    link->rlpl_pathlen);
+			}
+		}
+		kmem_free(owners, llp->rlp_nfound * sizeof (*owners));
+		if (err != 0)
+			return (err);
+	}
+	return (0);
+}
+
+/*
+ * Phase C, final pass: every branch-created pool identity the
+ * correspondence passes left UNPAIRED gets its own synthetic id.
+ * Raw pool object numbers must never survive into targets: clones
+ * allocate object numbers in lockstep, so two unrelated
+ * single-side pools usually collide numerically, and every
+ * downstream consumer that keys by target identity -- the final
+ * groups above all -- would glue them into one (X16's first
+ * execution caught exactly that, as a false LINKPOOL_CONTENT on a
+ * merged group; U5's fixture carried the same phantom group
+ * unseen). After this pass a shared id means one thing only:
+ * phase C proved the two sides expressed the same pool. Separate
+ * pools now stay separate all the way into emit, which also
+ * settles the U2/U6 distinctness question. Conflict keys are not
+ * rewritten: the overlap conflict above keys by the identity in
+ * force at emission time, and records keep real object numbers.
+ */
+static void
+rebase_relabel_unpaired(rebase_merge_ctx_t *ctx)
+{
+	rebase_state_t *rs = ctx->rmc_rs;
+	rebase_linkpool_table_t *rlpts[2] = {
+		&rs->rs_left_linkpools, &rs->rs_right_linkpools
+	};
+	int sides[2] = { REBASE_WALK_LEFT, REBASE_WALK_RIGHT };
+
+	for (int i = 0; i < 2; i++) {
+		rebase_linkpool_t *lp;
+
+		for (lp = avl_first(&rlpts[i]->rlpt_by_obj);
+		    lp != NULL;
+		    lp = AVL_NEXT(&rlpts[i]->rlpt_by_obj, lp)) {
+			rebase_mtarget_kind_t kind;
+
+			switch (lp->rlp_state) {
+			case REBASE_LINKPOOL_NOVEL:
+			case REBASE_LINKPOOL_RECYCLED:
+				kind = REBASE_TARGET_NOVEL;
+				break;
+			case REBASE_LINKPOOL_SPLIT_FRAGMENT:
+				kind = REBASE_TARGET_FRAGMENT;
+				break;
+			default:
+				continue;
+			}
+			if (rebase_unify_find(ctx, sides[i],
+			    lp->rlp_obj) != NULL)
+				continue;
+			rebase_relabel_pool(rs, lp, sides[i], kind,
+			    lp->rlp_obj,
+			    REBASE_UNIFIED_ID(ctx->rmc_next_uid++));
+		}
+	}
+}
+
+/*
+ * The seam consultation (membership-content-interface.md): a
+ * SAME_AS_BASE target only answered the MEMBERSHIP question, so
+ * before the deferring side loses this row to the other side's
+ * linkpool destination, its content record at the path -- if it
+ * has one -- gets a hearing. A claim is an ADD, EDIT, MOVE, or
+ * MOVE_EDIT record: the file that side put at this path. Winners
+ * that are not pool destinations need no consultation (a GONE or
+ * STANDALONE winner leaves the path visible to samepath and the
+ * dead-pool rules). No claim defers exactly as before. A claim
+ * whose object is the path's BASE lineage is a pool-level edit
+ * that the lineage's group merge and the dead-pool scan already
+ * own (the base-pool ground is leak-free), and a claim matching
+ * the destination's lineage is the grow case, owned by the
+ * winning group's merge -- both defer. A FOREIGN claim is
+ * compared side against side through the hysteria tiers:
+ * identical content is convergence and defers (the expressed
+ * sharing stands and the content is satisfied); different content
+ * is a real cross-domain collision, typed by the claim
+ * (CREATE_CREATE for ADD, MOVE_VS_EDIT for a move destination,
+ * BOTH_MODIFIED for EDIT), keyed by the destination identity, and
+ * the row stays undecided.
+ *
+ * Lineage identity is only ever tested against base-rooted
+ * numbers (an ANCHOR's lineage, a FRAGMENT's parent): a raw
+ * cross-side object match is a lockstep-allocation coincidence
+ * (U5's lesson), and a synthetic unified id is not an object at
+ * all, so the data compare reads the expressing side's pool dnode
+ * straight from its own linkpool table at the path.
+ */
+static int
+rebase_row_defer(rebase_state_t *rs, rebase_walk_ctx_t *rwc,
+    rebase_ppath_t *rpp, boolean_t left_defers)
+{
+	const rebase_mtarget_t *winner = left_defers ?
+	    &rpp->rpp_right : &rpp->rpp_left;
+	rebase_changelist_t *rcl;
+	rebase_linkpool_t *lp, *base_lp;
+	rebase_change_t *rc;
+	rebase_conflict_type_t type;
+	boolean_t same;
+	uint64_t key;
+	int err;
+
+	if (winner->rmt_kind != REBASE_TARGET_ANCHOR &&
+	    winner->rmt_kind != REBASE_TARGET_FRAGMENT &&
+	    winner->rmt_kind != REBASE_TARGET_NOVEL) {
+		rpp->rpp_final = *winner;
+		return (0);
+	}
+
+	rcl = left_defers ? &rs->rs_left_changes :
+	    &rs->rs_right_changes;
+	rc = rebase_change_at(rcl, rpp->rpp_path);
+	if (rc == NULL ||
+	    (rc->rc_content_op != REBASE_CONTENT_ADD &&
+	    rc->rc_content_op != REBASE_CONTENT_EDIT &&
+	    rc->rc_content_op != REBASE_CONTENT_MOVE &&
+	    rc->rc_content_op != REBASE_CONTENT_MOVE_EDIT)) {
+		rpp->rpp_final = *winner;
+		return (0);
+	}
+
+	base_lp = rebase_linkpool_of(&rs->rs_base_linkpools,
+	    rpp->rpp_path);
+	if (base_lp != NULL && rc->rc_obj == base_lp->rlp_obj) {
+		rpp->rpp_final = *winner;
+		return (0);
+	}
+	if ((winner->rmt_kind == REBASE_TARGET_ANCHOR ||
+	    winner->rmt_kind == REBASE_TARGET_FRAGMENT) &&
+	    rc->rc_obj == winner->rmt_linkpool) {
+		rpp->rpp_final = *winner;
+		return (0);
+	}
+
+	lp = rebase_linkpool_of(left_defers ?
+	    &rs->rs_right_linkpools : &rs->rs_left_linkpools,
+	    rpp->rpp_path);
+	ASSERT3P(lp, !=, NULL);
+	err = rebase_is_hysterical(rwc,
+	    left_defers ? REBASE_WALK_LEFT : REBASE_WALK_RIGHT,
+	    rc->rc_obj,
+	    left_defers ? REBASE_WALK_RIGHT : REBASE_WALK_LEFT,
+	    lp->rlp_obj, B_FALSE, &same);
+	if (err != 0)
+		return (err);
+	if (same) {
+		rpp->rpp_final = *winner;
+		return (0);
+	}
+
+	switch (rc->rc_content_op) {
+	case REBASE_CONTENT_ADD:
+		type = REBASE_CONFLICT_CREATE_CREATE;
+		break;
+	case REBASE_CONTENT_MOVE:
+	case REBASE_CONTENT_MOVE_EDIT:
+		type = REBASE_CONFLICT_MOVE_VS_EDIT;
+		break;
+	default:
+		type = REBASE_CONFLICT_BOTH_MODIFIED;
+		break;
+	}
+	key = (winner->rmt_kind == REBASE_TARGET_FRAGMENT) ?
+	    winner->rmt_fragment : winner->rmt_linkpool;
+	rebase_conflict_add(rs, type, key, rpp->rpp_path,
+	    rpp->rpp_pathlen);
+	return (0);
+}
+
+/*
+ * Phase D, one row: the three-way membership merge. Agreement
+ * wins; SAME_AS_BASE defers (it is "expressed nothing", never a
+ * vote, which is what lets a lone sever or delete win with no
+ * conflict and no union) -- after the seam consultation above has
+ * cleared the deferring side's content record, when the winner is
+ * a pool destination. Both-sides-expressed disagreements:
+ * GONE against STANDALONE is the delete-vs-sever near-equivalence,
+ * settled by rs_policy and surfaced as DELETE_VS_RELINK when no
+ * policy is given (doc note 2026-08-23: a dedicated type is not
+ * worth a contract change -- both shapes are "delete versus a
+ * membership change the delete never saw"); GONE against a
+ * linkpool destination is DELETE_VS_RELINK outright; contradictory
+ * linkpool destinations are DIVERGENT_MEMBERSHIP. Both-NOVEL
+ * disagreements are phase C's domain -- the shared row proves the
+ * pools overlapped, so C either unified the ids or already emitted
+ * the overlap conflict -- and the row is left undecided here, not
+ * double-reported. A conflicted row keeps rpp_final at
+ * REBASE_TARGET_UNSET: no decision is the honest record, and the
+ * dead-pool scan treats such members as keeping their pool alive.
+ */
+static int
+rebase_merge_row(rebase_state_t *rs, rebase_walk_ctx_t *rwc,
+    rebase_ppath_t *rpp)
+{
+	const rebase_mtarget_t *l = &rpp->rpp_left;
+	const rebase_mtarget_t *r = &rpp->rpp_right;
+	const rebase_mtarget_t *other;
+	rebase_linkpool_t *base_lp;
+	uint64_t obj;
+
+	/*
+	 * Both-NOVEL rows are phase C's domain and must be settled
+	 * BEFORE the generic equality test: equal ids mean "same
+	 * group" only when phase C actually unified them. After the
+	 * unpaired relabel pass every branch pool identity is
+	 * synthetic, so equal ids can only be one shared uid; the
+	 * REBASE_ID_IS_UNIFIED check enforces that invariant rather
+	 * than filtering raw ids (clones allocate object numbers in
+	 * lockstep, so raw ids collided numerically -- U5's first
+	 * run caught it here at the row level, X16's at the group
+	 * level, and the relabel pass now keeps raw ids out of
+	 * targets entirely). An unresolved both-NOVEL row stays
+	 * undecided; C already emitted its conflict.
+	 */
+	if (l->rmt_kind == REBASE_TARGET_NOVEL &&
+	    r->rmt_kind == REBASE_TARGET_NOVEL) {
+		if (rebase_mtarget_equal(l, r) &&
+		    REBASE_ID_IS_UNIFIED(l->rmt_linkpool))
+			rpp->rpp_final = *l;
+		return (0);
+	}
+
+	if (rebase_mtarget_equal(l, r)) {
+		rpp->rpp_final = *l;
+		return (0);
+	}
+	if (l->rmt_kind == REBASE_TARGET_SAME_AS_BASE)
+		return (rebase_row_defer(rs, rwc, rpp, B_TRUE));
+	if (r->rmt_kind == REBASE_TARGET_SAME_AS_BASE)
+		return (rebase_row_defer(rs, rwc, rpp, B_FALSE));
+
+	if (l->rmt_kind == REBASE_TARGET_GONE ||
+	    r->rmt_kind == REBASE_TARGET_GONE) {
+		other = (l->rmt_kind == REBASE_TARGET_GONE) ? r : l;
+
+		if (other->rmt_kind == REBASE_TARGET_STANDALONE) {
+			switch (rs->rs_policy) {
+			case REBASE_POLICY_LEFT:
+				rpp->rpp_final = *l;
+				return (0);
+			case REBASE_POLICY_RIGHT:
+				rpp->rpp_final = *r;
+				return (0);
+			case REBASE_POLICY_BASE:
+			case REBASE_POLICY_NEITHER:
+				rpp->rpp_final.rmt_kind =
+				    REBASE_TARGET_SAME_AS_BASE;
+				rpp->rpp_final.rmt_linkpool = 0;
+				rpp->rpp_final.rmt_fragment = 0;
+				return (0);
+			case REBASE_POLICY_NONE:
+			default:
+				base_lp = rebase_linkpool_of(
+				    &rs->rs_base_linkpools,
+				    rpp->rpp_path);
+				rebase_conflict_add(rs,
+				    REBASE_CONFLICT_DELETE_VS_RELINK,
+				    base_lp != NULL ?
+				    base_lp->rlp_obj : 0,
+				    rpp->rpp_path, rpp->rpp_pathlen);
+				return (0);
+			}
+		}
+
+		obj = (other->rmt_kind == REBASE_TARGET_FRAGMENT) ?
+		    other->rmt_fragment : other->rmt_linkpool;
+		rebase_conflict_add(rs,
+		    REBASE_CONFLICT_DELETE_VS_RELINK, obj,
+		    rpp->rpp_path, rpp->rpp_pathlen);
+		return (0);
+	}
+
+	/*
+	 * Contradictory destinations. Key the conflict by the most
+	 * base-rooted identity involved, left first: a lineage or
+	 * fragment parent when one exists, a novel group id
+	 * otherwise.
+	 */
+	if (l->rmt_kind == REBASE_TARGET_ANCHOR ||
+	    l->rmt_kind == REBASE_TARGET_FRAGMENT)
+		obj = l->rmt_linkpool;
+	else if (r->rmt_kind == REBASE_TARGET_ANCHOR ||
+	    r->rmt_kind == REBASE_TARGET_FRAGMENT)
+		obj = r->rmt_linkpool;
+	else
+		obj = l->rmt_linkpool;
+	rebase_conflict_add(rs, REBASE_CONFLICT_DIVERGENT_MEMBERSHIP,
+	    obj, rpp->rpp_path, rpp->rpp_pathlen);
+	return (0);
+}
+
+/*
+ * A scratch mark for the dead-pool scan.
+ */
+typedef struct rebase_alive_mark {
+	uint64_t	ram_obj;
+	avl_node_t	ram_avl;
+} rebase_alive_mark_t;
+
+static int
+rebase_alive_cmp(const void *a, const void *b)
+{
+	const rebase_alive_mark_t *ma = a;
+	const rebase_alive_mark_t *mb = b;
+
+	return (TREE_CMP(ma->ram_obj, mb->ram_obj));
+}
+
+/*
+ * Unlink is not delete: a base linkpool's data dies only when its
+ * merged membership reaches zero. When it does, and a side that
+ * still believed the linkpool lived (it kept at least one member)
+ * edited the content, that is the real delete-vs-edit conflict --
+ * surfaced ONCE at linkpool level with the member list as alt
+ * paths, never once per member. The edit evidence is record-based
+ * (an EDIT or MOVE_EDIT on the linkpool's object): hysteria
+ * already guarantees records exist exactly when content really
+ * changed, so no data is read here. Conflicted (UNSET) members
+ * keep the pool alive: its fate is already in the manifest and is
+ * not compounded.
+ */
+static void
+rebase_dead_pool_scan(rebase_state_t *rs)
+{
+	avl_tree_t alive;
+	rebase_alive_mark_t *ram, key;
+	rebase_ppath_t *rpp;
+	rebase_linkpool_t *lp;
+	void *cookie = NULL;
+
+	avl_create(&alive, rebase_alive_cmp,
+	    sizeof (rebase_alive_mark_t),
+	    offsetof(rebase_alive_mark_t, ram_avl));
+
+	for (rpp = avl_first(&rs->rs_ppaths); rpp != NULL;
+	    rpp = AVL_NEXT(&rs->rs_ppaths, rpp)) {
+		uint64_t obj = 0;
+
+		if (rpp->rpp_final.rmt_kind == REBASE_TARGET_ANCHOR) {
+			obj = rpp->rpp_final.rmt_linkpool;
+		} else if (rpp->rpp_final.rmt_kind ==
+		    REBASE_TARGET_SAME_AS_BASE ||
+		    rpp->rpp_final.rmt_kind == REBASE_TARGET_UNSET) {
+			rebase_linkpool_t *base_lp;
+
+			base_lp = rebase_linkpool_of(
+			    &rs->rs_base_linkpools, rpp->rpp_path);
+			if (base_lp != NULL)
+				obj = base_lp->rlp_obj;
+		}
+		if (obj == 0)
+			continue;
+
+		key.ram_obj = obj;
+		if (avl_find(&alive, &key, NULL) == NULL) {
+			ram = kmem_zalloc(sizeof (*ram), KM_SLEEP);
+			ram->ram_obj = obj;
+			avl_add(&alive, ram);
+		}
+	}
+
+	for (lp = avl_first(&rs->rs_base_linkpools.rlpt_by_obj);
+	    lp != NULL;
+	    lp = AVL_NEXT(&rs->rs_base_linkpools.rlpt_by_obj, lp)) {
+		rebase_linkpool_link_t *link;
+		boolean_t kept_left = B_FALSE, kept_right = B_FALSE;
+		boolean_t edited;
+
+		key.ram_obj = lp->rlp_obj;
+		if (avl_find(&alive, &key, NULL) != NULL)
+			continue;
+
+		for (link = list_head(&lp->rlp_links); link != NULL;
+		    link = list_next(&lp->rlp_links, link)) {
+			rpp = rebase_ppath_find(rs, link->rlpl_path);
+			if (rpp == NULL)
+				continue;
+			if (rpp->rpp_left.rmt_kind ==
+			    REBASE_TARGET_SAME_AS_BASE)
+				kept_left = B_TRUE;
+			if (rpp->rpp_right.rmt_kind ==
+			    REBASE_TARGET_SAME_AS_BASE)
+				kept_right = B_TRUE;
+		}
+
+		edited = (kept_left && rebase_side_edits_obj(
+		    &rs->rs_left_changes, lp->rlp_obj)) ||
+		    (kept_right && rebase_side_edits_obj(
+		    &rs->rs_right_changes, lp->rlp_obj));
+		if (!edited)
+			continue;
+
+		for (link = list_head(&lp->rlp_links); link != NULL;
+		    link = list_next(&lp->rlp_links, link)) {
+			rebase_conflict_add(rs,
+			    REBASE_CONFLICT_LINKPOOL_CONTENT,
+			    lp->rlp_obj, link->rlpl_path,
+			    link->rlpl_pathlen);
+		}
+	}
+
+	while ((ram = avl_destroy_nodes(&alive, &cookie)) != NULL)
+		kmem_free(ram, sizeof (*ram));
+	avl_destroy(&alive);
+}
+
+/*
+ * Cross-reference phases C and D driver: unify fragment and novel
+ * correspondences across the branches, merge every membership row
+ * to its final target, then run the dead-pool sweep. The finals
+ * and conflicts dbgmsg lines are stable harness contracts; both
+ * log only on success.
+ */
+static int
+rebase_membership_merge(rebase_state_t *rs)
+{
+	rebase_merge_ctx_t ctx;
+	rebase_unify_entry_t *rue;
+	rebase_ppath_t *rpp;
+	rebase_conflict_t *rcf;
+	uint64_t tf[REBASE_TARGET_NOVEL + 1] = { 0 };
+	uint64_t nrelink = 0, ndivergent = 0, noverlap = 0,
+	    ncontent = 0;
+	void *cookie = NULL;
+	int err;
+
+	memset(&ctx, 0, sizeof (ctx));
+	ctx.rmc_rs = rs;
+	ctx.rmc_rwc.rwc_rs = rs;
+	ctx.rmc_rwc.rwc_os[REBASE_WALK_LEFT] = rs->rs_left_os;
+	ctx.rmc_rwc.rwc_os[REBASE_WALK_BASE] = rs->rs_base_os;
+	ctx.rmc_rwc.rwc_os[REBASE_WALK_RIGHT] = rs->rs_right_os;
+	ctx.rmc_rwc.rwc_sa[REBASE_WALK_LEFT] = rs->rs_left_sa;
+	ctx.rmc_rwc.rwc_sa[REBASE_WALK_BASE] = rs->rs_base_sa;
+	ctx.rmc_rwc.rwc_sa[REBASE_WALK_RIGHT] = rs->rs_right_sa;
+	ctx.rmc_rwc.rwc_za = zap_attribute_alloc();
+	avl_create(&ctx.rmc_umap, rebase_unify_cmp,
+	    sizeof (rebase_unify_entry_t),
+	    offsetof(rebase_unify_entry_t, rue_avl));
+	ctx.rmc_next_uid = 1;
+
+	rebase_unify_fragments(&ctx);
+	err = rebase_unify_novels(&ctx);
+	if (err == 0)
+		rebase_relabel_unpaired(&ctx);
+
+	if (err == 0) {
+		for (rpp = avl_first(&rs->rs_ppaths); rpp != NULL;
+		    rpp = AVL_NEXT(&rs->rs_ppaths, rpp)) {
+			err = rebase_merge_row(rs, &ctx.rmc_rwc, rpp);
+			if (err != 0)
+				break;
+		}
+		if (err == 0)
+			rebase_dead_pool_scan(rs);
+	}
+
+	while ((rue = avl_destroy_nodes(&ctx.rmc_umap,
+	    &cookie)) != NULL)
+		kmem_free(rue, sizeof (*rue));
+	avl_destroy(&ctx.rmc_umap);
+	zap_attribute_free(ctx.rmc_rwc.rwc_za);
+
+	if (err != 0) {
+		/*
+		 * Every compared dnode was witnessed by the walk on
+		 * an immutable snapshot; a vanished object here is
+		 * corrupt input, and a raw ENOENT would read as "no
+		 * common ancestor" at the ioctl boundary.
+		 */
+		if (err == ENOENT)
+			err = SET_ERROR(EIO);
+		return (err);
+	}
+
+	for (rpp = avl_first(&rs->rs_ppaths); rpp != NULL;
+	    rpp = AVL_NEXT(&rs->rs_ppaths, rpp))
+		tf[rpp->rpp_final.rmt_kind]++;
+
+	for (rcf = list_head(&rs->rs_manifest.rm_conflicts);
+	    rcf != NULL;
+	    rcf = list_next(&rs->rs_manifest.rm_conflicts, rcf)) {
+		switch (rcf->rcf_type) {
+		case REBASE_CONFLICT_DELETE_VS_RELINK:
+			nrelink++;
+			break;
+		case REBASE_CONFLICT_DIVERGENT_MEMBERSHIP:
+			ndivergent++;
+			break;
+		case REBASE_CONFLICT_NOVEL_LINKPOOL_OVERLAP:
+			noverlap++;
+			break;
+		case REBASE_CONFLICT_LINKPOOL_CONTENT:
+			ncontent++;
+			break;
+		default:
+			break;
+		}
+	}
+
+	zfs_dbgmsg("rebase: finals same %llu gone %llu "
+	    "standalone %llu anchor %llu fragment %llu novel %llu "
+	    "conflict %llu",
+	    (u_longlong_t)tf[REBASE_TARGET_SAME_AS_BASE],
+	    (u_longlong_t)tf[REBASE_TARGET_GONE],
+	    (u_longlong_t)tf[REBASE_TARGET_STANDALONE],
+	    (u_longlong_t)tf[REBASE_TARGET_ANCHOR],
+	    (u_longlong_t)tf[REBASE_TARGET_FRAGMENT],
+	    (u_longlong_t)tf[REBASE_TARGET_NOVEL],
+	    (u_longlong_t)tf[REBASE_TARGET_UNSET]);
+	zfs_dbgmsg("rebase: conflicts total %llu relink %llu "
+	    "divergent %llu overlap %llu content %llu",
+	    (u_longlong_t)rs->rs_manifest.rm_nconflicts,
+	    (u_longlong_t)nrelink, (u_longlong_t)ndivergent,
+	    (u_longlong_t)noverlap, (u_longlong_t)ncontent);
+	return (0);
+}
+
 int
 dsl_rebase(const char *left_ds, const char *right_ds, nvlist_t *outnvl)
 {
@@ -2974,9 +3974,13 @@ dsl_rebase(const char *left_ds, const char *right_ds, nvlist_t *outnvl)
 	if (err == 0)
 		rebase_membership_targets(&state);
 
+	/* Phases C+D: unify correspondences, merge memberships. */
+	if (err == 0)
+		err = rebase_membership_merge(&state);
+
 	/*
-	 * Diff pipeline complete through cross-reference phase B.
-	 * Subsequent issues fill in phases C-F, emit, and apply
+	 * Diff pipeline complete through cross-reference phase D.
+	 * Subsequent issues fill in phases E-F, emit, and apply
 	 * here; until they land, a successful diff still exits
 	 * with ENOSYS.
 	 */
