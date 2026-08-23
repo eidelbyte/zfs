@@ -4871,6 +4871,464 @@ rebase_consistency_sweep(rebase_state_t *rs)
 	}
 }
 
+/*
+ * Resolve a path to an object in one static tree by walking its
+ * components from the given root. Returns 0 through *objp when any
+ * component is absent; only real errors propagate.
+ */
+static int
+rebase_tree_lookup(objset_t *os, uint64_t root, const char *path,
+    uint64_t *objp)
+{
+	char comp[MAXNAMELEN];
+	uint64_t dir = root, v;
+	const char *p = path;
+	int err;
+
+	*objp = 0;
+	while (*p == '/')
+		p++;
+	if (*p == '\0') {
+		*objp = root;
+		return (0);
+	}
+
+	while (*p != '\0') {
+		const char *slash = strchr(p, '/');
+		size_t len = (slash != NULL) ? (size_t)(slash - p) :
+		    strlen(p);
+
+		if (len == 0 || len >= sizeof (comp))
+			return (0);
+		memcpy(comp, p, len);
+		comp[len] = '\0';
+
+		err = zap_lookup(os, dir, comp, 8, 1, &v);
+		if (err == ENOENT)
+			return (0);
+		if (err != 0)
+			return (err);
+		dir = ZFS_DIRENT_OBJ(v);
+
+		if (slash == NULL)
+			break;
+		p = slash + 1;
+		while (*p == '/')
+			p++;
+	}
+	*objp = dir;
+	return (0);
+}
+
+/*
+ * Does this path exist in the MERGED namespace? Decided from the
+ * membership rows and changelists where they speak, falling back
+ * to presence in the left snapshot (left equals base plus left's
+ * changes, and unmentioned paths carry over). Conflicted rows
+ * count as present: an undecided path must not generate dangling
+ * warnings on top of its conflict. Collapsed moves' old paths
+ * need no case of their own: every one of them carries a
+ * synthesized GONE row.
+ */
+static int
+rebase_final_present(rebase_state_t *rs, const char *path,
+    boolean_t *presentp)
+{
+	rebase_ppath_t *rpp;
+	rebase_change_t *rc;
+	uint64_t obj;
+	int err;
+
+	rpp = rebase_ppath_find(rs, path);
+	if (rpp != NULL) {
+		*presentp = (rpp->rpp_final.rmt_kind !=
+		    REBASE_TARGET_GONE);
+		return (0);
+	}
+
+	rc = rebase_change_at(&rs->rs_left_changes, path);
+	if (rc != NULL) {
+		*presentp = (rc->rc_content_op !=
+		    REBASE_CONTENT_DELETE);
+		return (0);
+	}
+	rc = rebase_change_at(&rs->rs_right_changes, path);
+	if (rc != NULL) {
+		*presentp = (rc->rc_content_op !=
+		    REBASE_CONTENT_DELETE);
+		return (0);
+	}
+
+	err = rebase_tree_lookup(rs->rs_left_os, rs->rs_left_root,
+	    path, &obj);
+	if (err != 0)
+		return (err);
+	*presentp = (obj != 0);
+	return (0);
+}
+
+/*
+ * Read one symlink's target: the SA-resident form first, the
+ * data-block form otherwise. Targets at MAXPATHLEN or longer are
+ * reported as absent (*lenp = 0) rather than truncated -- the
+ * sweep is warn-only and a warning built from a truncated target
+ * would be a lie.
+ */
+static int
+rebase_symlink_target(objset_t *os, const sa_attr_type_t *tbl,
+    uint64_t obj, char *buf, size_t buflen, size_t *lenp)
+{
+	sa_handle_t *hdl;
+	uint64_t size = 0;
+	int sa_len;
+	int err;
+
+	*lenp = 0;
+
+	err = sa_handle_get(os, obj, NULL, SA_HDL_PRIVATE, &hdl);
+	if (err != 0)
+		return (err);
+
+	err = sa_size(hdl, tbl[ZPL_SYMLINK], &sa_len);
+	if (err == 0) {
+		if ((size_t)sa_len >= buflen) {
+			sa_handle_destroy(hdl);
+			return (0);
+		}
+		err = sa_lookup(hdl, tbl[ZPL_SYMLINK], buf,
+		    (uint32_t)sa_len);
+		if (err == 0) {
+			buf[sa_len] = '\0';
+			*lenp = sa_len;
+		}
+		sa_handle_destroy(hdl);
+		return (err);
+	}
+	if (err != ENOENT) {
+		sa_handle_destroy(hdl);
+		return (err);
+	}
+
+	/* Data-block form: the target is the file content. */
+	err = sa_lookup(hdl, tbl[ZPL_SIZE], &size, sizeof (size));
+	sa_handle_destroy(hdl);
+	if (err == ENOENT)
+		return (SET_ERROR(EIO));
+	if (err != 0)
+		return (err);
+	if (size == 0 || size >= buflen)
+		return (0);
+
+	err = dmu_read(os, obj, 0, size, buf,
+	    DMU_READ_NO_PREFETCH);
+	if (err != 0)
+		return (err);
+	buf[size] = '\0';
+	*lenp = size;
+	return (0);
+}
+
+/*
+ * Lexically normalize an absolute path in place: collapse "//",
+ * drop ".", pop a component for "..". No symlink chasing --
+ * nested-symlink and mountpoint-crossing targets are documented
+ * out of scope for the v1 sweep.
+ */
+static void
+rebase_normalize_path(char *path)
+{
+	char *out = path;
+	const char *p = path;
+
+	while (*p != '\0') {
+		while (*p == '/')
+			p++;
+		if (*p == '\0')
+			break;
+		if (p[0] == '.' && (p[1] == '/' || p[1] == '\0')) {
+			p += 1;
+			continue;
+		}
+		if (p[0] == '.' && p[1] == '.' &&
+		    (p[2] == '/' || p[2] == '\0')) {
+			while (out > path && *(out - 1) != '/')
+				out--;
+			if (out > path)
+				out--;
+			p += 2;
+			continue;
+		}
+		*out++ = '/';
+		while (*p != '\0' && *p != '/')
+			*out++ = *p++;
+	}
+	if (out == path)
+		*out++ = '/';
+	*out = '\0';
+}
+
+/*
+ * Evaluate one symlink that survives into the merged namespace:
+ * resolve its target (relative against its own parent directory,
+ * absolute against the dataset root, lexically) and warn with
+ * REBASE_WARN_DANGLING_SYMLINK when the target is not in the
+ * final tree -- unless the link was already dangling in base
+ * (pre-existing, not merge-caused). Dangling symlinks are legal;
+ * this is a warning, never a conflict.
+ */
+static int
+rebase_symlink_check(rebase_state_t *rs, const char *path,
+    size_t pathlen, objset_t *os, const sa_attr_type_t *tbl,
+    uint64_t obj, char *tbuf, char *rbuf)
+{
+	size_t tlen;
+	boolean_t present;
+	int err;
+
+	err = rebase_symlink_target(os, tbl, obj, tbuf, MAXPATHLEN,
+	    &tlen);
+	if (err != 0)
+		return (err);
+	if (tlen == 0)
+		return (0);
+
+	if (tbuf[0] == '/') {
+		(void) strlcpy(rbuf, tbuf, MAXPATHLEN);
+	} else {
+		const char *slash = strrchr(path, '/');
+		size_t plen = (slash != NULL) ?
+		    (size_t)(slash - path) : 0;
+
+		if (plen + 1 + tlen + 1 > MAXPATHLEN)
+			return (0);
+		memcpy(rbuf, path, plen);
+		rbuf[plen] = '/';
+		memcpy(rbuf + plen + 1, tbuf, tlen + 1);
+	}
+	rebase_normalize_path(rbuf);
+
+	err = rebase_final_present(rs, rbuf, &present);
+	if (err != 0)
+		return (err);
+	if (present)
+		return (0);
+
+	/*
+	 * Already dangling in base? Resolve the BASE link's own
+	 * target against the base tree; a pre-existing dangle is
+	 * not merge-caused and stays quiet.
+	 */
+	{
+		uint64_t base_obj, base_tgt;
+		size_t blen;
+
+		err = rebase_tree_lookup(rs->rs_base_os,
+		    rs->rs_base_root, path, &base_obj);
+		if (err != 0)
+			return (err);
+		if (base_obj != 0) {
+			err = rebase_symlink_target(rs->rs_base_os,
+			    rs->rs_base_sa, base_obj, tbuf,
+			    MAXPATHLEN, &blen);
+			if (err == 0 && blen > 0) {
+				if (tbuf[0] != '/') {
+					const char *slash =
+					    strrchr(path, '/');
+					size_t plen =
+					    (slash != NULL) ?
+					    (size_t)(slash - path) :
+					    0;
+					char *b2 = rbuf;
+
+					if (plen + 1 + blen + 1 <=
+					    MAXPATHLEN) {
+						memcpy(b2, path,
+						    plen);
+						b2[plen] = '/';
+						memcpy(b2 + plen + 1,
+						    tbuf, blen + 1);
+					} else {
+						b2 = NULL;
+					}
+					if (b2 != NULL) {
+						rebase_normalize_path(
+						    b2);
+						(void) strlcpy(tbuf,
+						    b2, MAXPATHLEN);
+					}
+				}
+				rebase_normalize_path(tbuf);
+				err = rebase_tree_lookup(
+				    rs->rs_base_os,
+				    rs->rs_base_root, tbuf,
+				    &base_tgt);
+				if (err != 0)
+					return (err);
+				if (base_tgt == 0)
+					return (0);
+			} else if (err != 0) {
+				return (err);
+			}
+		}
+	}
+
+	rebase_warning_add(rs, REBASE_WARN_DANGLING_SYMLINK, obj,
+	    path, pathlen);
+	return (0);
+}
+
+/*
+ * Dirent type nibbles as ZPL stores them: the POSIX format bits
+ * shifted down 12, part of the on-disk dirent ABI -- defined
+ * locally because the S_IF* constants are not visible to common
+ * kernel code on every platform, while the VALUES are fixed by
+ * the format itself.
+ */
+#define	REBASE_DT_DIR	4	/* (S_IFDIR >> 12) */
+#define	REBASE_DT_LNK	10	/* (S_IFLNK >> 12) */
+
+/*
+ * Recursively scan the left snapshot for symlinks by dirent type
+ * nibble -- no per-file SA reads; ZPL stores the type nibble in
+ * every entry it writes and the ZPL >= 5 precondition guarantees
+ * modern dirents. Each symlink still present in the merged
+ * namespace is checked; paths the merge removed are skipped at
+ * the presence gate inside the check's caller.
+ */
+static int
+rebase_symlink_scan_dir(rebase_state_t *rs, uint64_t dir,
+    const char *path, size_t pathlen, zap_attribute_t *za,
+    char *tbuf, char *rbuf)
+{
+	zap_cursor_t zc;
+	int err = 0;
+
+	for (zap_cursor_init(&zc, rs->rs_left_os, dir);
+	    (err = zap_cursor_retrieve(&zc, za)) == 0;
+	    zap_cursor_advance(&zc)) {
+		uint64_t obj = ZFS_DIRENT_OBJ(za->za_first_integer);
+		uint64_t dtype =
+		    ZFS_DIRENT_TYPE(za->za_first_integer);
+		char *cpath;
+		size_t cpathlen;
+
+		if (dtype != REBASE_DT_LNK &&
+		    dtype != REBASE_DT_DIR)
+			continue;
+
+		cpath = rebase_build_path(path, pathlen,
+		    za->za_name, &cpathlen);
+
+		if (dtype == REBASE_DT_DIR) {
+			err = rebase_symlink_scan_dir(rs, obj,
+			    cpath, cpathlen, za, tbuf, rbuf);
+		} else {
+			boolean_t present;
+
+			err = rebase_final_present(rs, cpath,
+			    &present);
+			if (err == 0 && present) {
+				err = rebase_symlink_check(rs,
+				    cpath, cpathlen,
+				    rs->rs_left_os, rs->rs_left_sa,
+				    obj, tbuf, rbuf);
+			}
+		}
+		kmem_free(cpath, cpathlen);
+		if (err != 0) {
+			zap_cursor_fini(&zc);
+			return (err);
+		}
+	}
+	zap_cursor_fini(&zc);
+	if (err == ENOENT)
+		err = 0;
+	return (err);
+}
+
+/*
+ * Phase F's symlink sweep: after the merged namespace is decided,
+ * every surviving symlink's target is resolved against the final
+ * tree. Candidates come from two places: the left snapshot scan
+ * (left is base plus left's changes, so it carries every
+ * pre-existing and left-created link), and the right changelist
+ * (links only the right side created or moved -- evaluated at
+ * their final paths, skipping conflicted objects).
+ */
+static int
+rebase_symlink_sweep(rebase_state_t *rs)
+{
+	zap_attribute_t *za;
+	rebase_change_t *rc;
+	char *tbuf, *rbuf;
+	int err;
+
+	za = zap_attribute_alloc();
+	tbuf = kmem_alloc(MAXPATHLEN, KM_SLEEP);
+	rbuf = kmem_alloc(MAXPATHLEN, KM_SLEEP);
+
+	err = rebase_symlink_scan_dir(rs, rs->rs_left_root, "/", 2,
+	    za, tbuf, rbuf);
+
+	for (rc = avl_first(&rs->rs_right_changes.rcl_by_path);
+	    err == 0 && rc != NULL;
+	    rc = AVL_NEXT(&rs->rs_right_changes.rcl_by_path, rc)) {
+		dmu_object_info_t doi;
+		sa_handle_t *hdl;
+		uint64_t mode = 0;
+		boolean_t present;
+
+		if (rc->rc_content_op == REBASE_CONTENT_DELETE)
+			continue;
+		if (rebase_change_at(&rs->rs_left_changes,
+		    rc->rc_path) != NULL)
+			continue;
+		if (rebase_conflict_covers(&rs->rs_manifest,
+		    rc->rc_path, rc->rc_obj))
+			continue;
+
+		err = dmu_object_info(rs->rs_right_os, rc->rc_obj,
+		    &doi);
+		if (err != 0)
+			break;
+		if (doi.doi_type == DMU_OT_DIRECTORY_CONTENTS)
+			continue;
+
+		err = sa_handle_get(rs->rs_right_os, rc->rc_obj,
+		    NULL, SA_HDL_PRIVATE, &hdl);
+		if (err != 0)
+			break;
+		err = sa_lookup(hdl, rs->rs_right_sa[ZPL_MODE],
+		    &mode, sizeof (mode));
+		sa_handle_destroy(hdl);
+		if (err == ENOENT) {
+			err = SET_ERROR(EIO);
+			break;
+		}
+		if (err != 0)
+			break;
+		if (((mode >> 12) & 0xf) != REBASE_DT_LNK)
+			continue;
+
+		err = rebase_final_present(rs, rc->rc_path,
+		    &present);
+		if (err == 0 && present) {
+			err = rebase_symlink_check(rs, rc->rc_path,
+			    rc->rc_pathlen, rs->rs_right_os,
+			    rs->rs_right_sa, rc->rc_obj, tbuf,
+			    rbuf);
+		}
+	}
+
+	kmem_free(rbuf, MAXPATHLEN);
+	kmem_free(tbuf, MAXPATHLEN);
+	zap_attribute_free(za);
+
+	if (err == ENOENT)
+		err = SET_ERROR(EIO);
+	return (err);
+}
+
 static const char *
 rebase_conflict_type_name(rebase_conflict_type_t type)
 {
@@ -5138,6 +5596,10 @@ dsl_rebase(const char *left_ds, const char *right_ds, nvlist_t *outnvl)
 	/* Phase F: warnings and the action list. */
 	if (err == 0)
 		rebase_consistency_sweep(&state);
+
+	/* Phase F's symlink sweep over the merged namespace. */
+	if (err == 0)
+		err = rebase_symlink_sweep(&state);
 
 	/*
 	 * The diff pipeline is complete: a successful rebase now
