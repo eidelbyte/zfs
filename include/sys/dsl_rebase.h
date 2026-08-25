@@ -398,6 +398,15 @@ typedef struct rebase_action {
 	/* which objset the content or link source comes from */
 	rebase_content_src_t	ra_src;
 	uint64_t		ra_src_obj;	/* dnode there (0 = n/a) */
+	/*
+	 * UNLINK only: removing this action's last name kills the
+	 * object (unlink is not delete -- a linkpool member's data
+	 * dies only when the merged roster reached zero, and a move
+	 * source's object lives on at its destination). Phase F
+	 * computes the answer once, at action-compile time; apply
+	 * trusts it and never re-derives the merge decision.
+	 */
+	boolean_t		ra_frees_object;
 	list_node_t		ra_node;	/* in rm_actions	*/
 } rebase_action_t;
 

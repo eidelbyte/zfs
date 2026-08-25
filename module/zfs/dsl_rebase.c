@@ -3991,7 +3991,7 @@ rebase_warning_add(rebase_state_t *rs, rebase_warning_kind_t kind,
 	rm->rm_nwarnings++;
 }
 
-static void
+static rebase_action_t *
 rebase_action_add(rebase_state_t *rs, rebase_action_type_t type,
     const char *path, size_t pathlen, uint64_t obj,
     rebase_content_src_t src, uint64_t src_obj)
@@ -4009,6 +4009,7 @@ rebase_action_add(rebase_state_t *rs, rebase_action_type_t type,
 	ra->ra_src_obj = src_obj;
 	list_insert_tail(&rm->rm_actions, ra);
 	rm->rm_nactions++;
+	return (ra);
 }
 
 /*
@@ -4632,6 +4633,42 @@ rebase_content_merge(rebase_state_t *rs)
 }
 
 /*
+ * Does this base linkpool reach the merged namespace with ZERO
+ * members? Mirrors the dead-pool scan's aliveness rule over ALL
+ * rows, not just the pool's own member paths -- a path newly
+ * relinked INTO the pool keeps it alive even though no base
+ * member's row does. A row keeps the pool alive when its final
+ * is ANCHOR(pool), or when it is SAME_AS_BASE or undecided at a
+ * path whose base pool is this one (conflicted members keep
+ * their pool alive exactly as the dead-pool scan ruled). Phase F
+ * asks once per compiled unlink; apply then trusts
+ * ra_frees_object and never re-derives the merge decision.
+ */
+static boolean_t
+rebase_pool_dead(rebase_state_t *rs, uint64_t obj)
+{
+	rebase_ppath_t *rpp;
+	rebase_linkpool_t *base_lp;
+
+	for (rpp = avl_first(&rs->rs_ppaths); rpp != NULL;
+	    rpp = AVL_NEXT(&rs->rs_ppaths, rpp)) {
+		const rebase_mtarget_t *f = &rpp->rpp_final;
+
+		if (f->rmt_kind == REBASE_TARGET_ANCHOR &&
+		    f->rmt_linkpool == obj)
+			return (B_FALSE);
+		if (f->rmt_kind == REBASE_TARGET_SAME_AS_BASE ||
+		    f->rmt_kind == REBASE_TARGET_UNSET) {
+			base_lp = rebase_linkpool_of(
+			    &rs->rs_base_linkpools, rpp->rpp_path);
+			if (base_lp != NULL && base_lp->rlp_obj == obj)
+				return (B_FALSE);
+		}
+	}
+	return (B_TRUE);
+}
+
+/*
  * Cross-reference phase F: the consistency sweep. Emits the
  * warnings that keep hardlink merges honest, then compiles the
  * action list the apply epic will consume. Purely in-memory: every
@@ -4645,6 +4682,7 @@ rebase_consistency_sweep(rebase_state_t *rs)
 	rebase_linkpool_group_t *rlpg;
 	rebase_ppath_t *rpp;
 	rebase_change_t *rc;
+	rebase_action_t *ra;
 
 	for (rlpg = avl_first(&rs->rs_groups); rlpg != NULL;
 	    rlpg = AVL_NEXT(&rs->rs_groups, rlpg)) {
@@ -4743,10 +4781,28 @@ rebase_consistency_sweep(rebase_state_t *rs)
 		switch (f->rmt_kind) {
 		case REBASE_TARGET_GONE:
 			if (left_silent) {
-				rebase_action_add(rs,
+				rebase_linkpool_t *base_lp;
+				rebase_action_t *ra;
+
+				/*
+				 * Row-driven unlinks are pool
+				 * ground (the standalone gate
+				 * above); the object dies only if
+				 * the merged roster emptied.
+				 */
+				base_lp = rebase_linkpool_of(
+				    &rs->rs_base_linkpools,
+				    rpp->rpp_path);
+				ra = rebase_action_add(rs,
 				    REBASE_ACTION_UNLINK,
 				    rpp->rpp_path, rpp->rpp_pathlen,
-				    0, REBASE_SRC_RIGHT, 0);
+				    base_lp != NULL ?
+				    base_lp->rlp_obj : 0,
+				    REBASE_SRC_RIGHT, 0);
+				ra->ra_frees_object =
+				    (base_lp != NULL &&
+				    rebase_pool_dead(rs,
+				    base_lp->rlp_obj));
 			}
 			break;
 		case REBASE_TARGET_STANDALONE:
@@ -4846,15 +4902,26 @@ rebase_consistency_sweep(rebase_state_t *rs)
 			    REBASE_SRC_RIGHT, rc->rc_obj);
 			break;
 		case REBASE_CONTENT_DELETE:
-			rebase_action_add(rs, REBASE_ACTION_UNLINK,
-			    rc->rc_path, rc->rc_pathlen, 0,
+			/*
+			 * Standalone ground: the deleted path was
+			 * nobody's linkpool business, so its object
+			 * had one name and dies with it.
+			 */
+			ra = rebase_action_add(rs,
+			    REBASE_ACTION_UNLINK,
+			    rc->rc_path, rc->rc_pathlen, rc->rc_obj,
 			    REBASE_SRC_RIGHT, 0);
+			ra->ra_frees_object = B_TRUE;
 			break;
 		case REBASE_CONTENT_MOVE:
 		case REBASE_CONTENT_MOVE_EDIT:
+			/*
+			 * A move source's object lives on at the
+			 * destination: never freed here.
+			 */
 			rebase_action_add(rs, REBASE_ACTION_UNLINK,
-			    rc->rc_old_path, rc->rc_old_pathlen, 0,
-			    REBASE_SRC_RIGHT, 0);
+			    rc->rc_old_path, rc->rc_old_pathlen,
+			    rc->rc_obj, REBASE_SRC_RIGHT, 0);
 			rebase_action_add(rs, REBASE_ACTION_LINK,
 			    rc->rc_path, rc->rc_pathlen, 0,
 			    REBASE_SRC_RIGHT, rc->rc_obj);
@@ -6140,11 +6207,260 @@ uint64_t rebase_apply_inject_stop_after = 0;
 int rebase_apply_inject_skip_rollback = 0;
 
 /*
- * The phase-1 apply driver. COPY actions apply in list order,
- * which is the right changelist's path order -- parents before
- * children. Actions of the other types belong to the later apply
- * phases and are counted as deferred; the tally line is a stable
- * harness contract. When no COPY action exists the HEAD is not
+ * Does any LINK action still reference this object? A tripwire,
+ * not a decision-maker: ra_frees_object already encodes the
+ * merge's answer, and an object that is both "dies here" and
+ * "gets linked later" means the action compiler contradicted
+ * itself. Freeing would turn that engine bug into a dangling
+ * dirent, so the caller logs loudly and keeps the object -- a
+ * leaked dnode is recoverable, a dirent to freed space is not.
+ */
+static boolean_t
+rebase_apply_link_pending(rebase_state_t *rs, uint64_t obj)
+{
+	rebase_action_t *ra;
+
+	for (ra = list_head(&rs->rs_manifest.rm_actions); ra != NULL;
+	    ra = list_next(&rs->rs_manifest.rm_actions, ra)) {
+		if (ra->ra_type == REBASE_ACTION_LINK &&
+		    (ra->ra_obj == obj || ra->ra_src_obj == obj))
+			return (B_TRUE);
+	}
+	return (B_FALSE);
+}
+
+/*
+ * Free one dead object in the HEAD: its xattr satellite state
+ * first (the hidden directory and every value child), then the
+ * object itself -- zap_destroy for directories, dmu_object_free
+ * for everything else. No delete queue: apply runs with the HEAD
+ * owned and unmounted, so nothing can hold the object open. Owns
+ * its transaction; the free holds are counted by walking the
+ * xattr directory before assigning.
+ */
+static int
+rebase_apply_free_object(const rebase_apply_ctx_t *rac, uint64_t obj)
+{
+	dmu_object_info_t doi;
+	sa_handle_t *hdl;
+	uint64_t xattr_obj = 0;
+	dmu_tx_t *tx;
+	int err;
+
+	err = dmu_object_info(rac->rac_os, obj, &doi);
+	if (err != 0)
+		return (err);
+	err = sa_handle_get(rac->rac_os, obj, NULL, SA_HDL_PRIVATE,
+	    &hdl);
+	if (err != 0)
+		return (err);
+	err = sa_lookup(hdl, rac->rac_sa[ZPL_XATTR], &xattr_obj,
+	    sizeof (xattr_obj));
+	sa_handle_destroy(hdl);
+	if (err == ENOENT) {
+		err = 0;
+		xattr_obj = 0;
+	}
+	if (err != 0)
+		return (err);
+
+	tx = dmu_tx_create(rac->rac_os);
+	dmu_tx_hold_free(tx, obj, 0, DMU_OBJECT_END);
+	if (xattr_obj != 0) {
+		zap_cursor_t zc;
+		zap_attribute_t *za = zap_attribute_alloc();
+
+		dmu_tx_hold_free(tx, xattr_obj, 0, DMU_OBJECT_END);
+		for (zap_cursor_init(&zc, rac->rac_os, xattr_obj);
+		    (err = zap_cursor_retrieve(&zc, za)) == 0;
+		    zap_cursor_advance(&zc)) {
+			dmu_tx_hold_free(tx,
+			    ZFS_DIRENT_OBJ(za->za_first_integer),
+			    0, DMU_OBJECT_END);
+		}
+		zap_cursor_fini(&zc);
+		zap_attribute_free(za);
+		if (err == ENOENT)
+			err = 0;
+		if (err != 0) {
+			dmu_tx_abort(tx);
+			return (err);
+		}
+	}
+
+	err = dmu_tx_assign(tx, DMU_TX_WAIT);
+	if (err != 0) {
+		dmu_tx_abort(tx);
+		return (err);
+	}
+	if (xattr_obj != 0)
+		err = rebase_free_xattr_dir(rac->rac_os, xattr_obj,
+		    tx);
+	if (err == 0) {
+		if (doi.doi_type == DMU_OT_DIRECTORY_CONTENTS)
+			err = zap_destroy(rac->rac_os, obj, tx);
+		else
+			err = dmu_object_free(rac->rac_os, obj, tx);
+	}
+	dmu_tx_commit(tx);
+	return (err);
+}
+
+/*
+ * Apply one UNLINK action: remove the directory entry, keep the
+ * object's link count true, and free the object when its last
+ * name goes AND the action says the merge killed it. Unlink is
+ * not delete: a linkpool member with surviving names elsewhere
+ * just counts down, and a move source's object lives on for the
+ * LINK phase (its link count may sit at zero between the two --
+ * apply owns the HEAD, so nothing can observe the gap). The
+ * parent directory is updated the way the ZPL unlink path leaves
+ * it: entry count, link count for subdirectories, times.
+ * Directories have exactly one name, so their death rides the
+ * flag alone, never a link count.
+ */
+static int
+rebase_apply_unlink(rebase_state_t *rs, const rebase_apply_ctx_t *rac,
+    const rebase_action_t *ra)
+{
+	sa_handle_t *obj_hdl, *par_hdl;
+	dmu_object_info_t doi;
+	dmu_tx_t *tx;
+	const char *name;
+	uint64_t parent_obj, val, links = 0, psize, plinks;
+	uint64_t times[2];
+	inode_timespec_t now;
+	boolean_t is_dir, free_now;
+	int err;
+
+	if (ra->ra_obj == 0) {
+		zfs_dbgmsg("rebase: apply unlink %s has no object",
+		    ra->ra_path);
+		return (SET_ERROR(EIO));
+	}
+
+	err = rebase_apply_parent(rac, ra->ra_path, &parent_obj,
+	    &name);
+	if (err != 0)
+		return (err);
+
+	/* The dirent must exist and point where the merge said. */
+	err = zap_lookup(rac->rac_os, parent_obj, name, 8, 1, &val);
+	if (err != 0)
+		return (err);
+	if (ZFS_DIRENT_OBJ(val) != ra->ra_obj) {
+		zfs_dbgmsg("rebase: apply unlink %s points at %llu "
+		    "not %llu", ra->ra_path,
+		    (u_longlong_t)ZFS_DIRENT_OBJ(val),
+		    (u_longlong_t)ra->ra_obj);
+		return (SET_ERROR(EIO));
+	}
+
+	err = dmu_object_info(rac->rac_os, ra->ra_obj, &doi);
+	if (err != 0)
+		return (err);
+	is_dir = (doi.doi_type == DMU_OT_DIRECTORY_CONTENTS);
+
+	err = sa_handle_get(rac->rac_os, ra->ra_obj, NULL,
+	    SA_HDL_PRIVATE, &obj_hdl);
+	if (err != 0)
+		return (err);
+	err = sa_lookup(obj_hdl, rac->rac_sa[ZPL_LINKS], &links,
+	    sizeof (links));
+	if (err == 0)
+		err = sa_handle_get(rac->rac_os, parent_obj, NULL,
+		    SA_HDL_PRIVATE, &par_hdl);
+	if (err != 0) {
+		sa_handle_destroy(obj_hdl);
+		return (err);
+	}
+
+	if (is_dir) {
+		free_now = ra->ra_frees_object;
+	} else {
+		if (links > 0)
+			links--;
+		free_now = (links == 0 && ra->ra_frees_object);
+	}
+	if (free_now && rebase_apply_link_pending(rs, ra->ra_obj)) {
+		zfs_dbgmsg("rebase: apply unlink %s would free obj "
+		    "%llu with a LINK pending", ra->ra_path,
+		    (u_longlong_t)ra->ra_obj);
+		free_now = B_FALSE;
+	}
+
+	tx = dmu_tx_create(rac->rac_os);
+	dmu_tx_hold_zap(tx, parent_obj, B_FALSE, name);
+	dmu_tx_hold_sa(tx, par_hdl, B_FALSE);
+	if (!is_dir && !free_now)
+		dmu_tx_hold_sa(tx, obj_hdl, B_FALSE);
+	err = dmu_tx_assign(tx, DMU_TX_WAIT);
+	if (err != 0) {
+		dmu_tx_abort(tx);
+		goto out;
+	}
+
+	err = zap_remove(rac->rac_os, parent_obj, name, tx);
+
+	if (err == 0 && !is_dir && !free_now)
+		err = sa_update(obj_hdl, rac->rac_sa[ZPL_LINKS],
+		    &links, sizeof (links), tx);
+
+	/* Parent bookkeeping, as the ZPL unlink path leaves it. */
+	if (err == 0) {
+		psize = 0;
+		err = sa_lookup(par_hdl, rac->rac_sa[ZPL_SIZE],
+		    &psize, sizeof (psize));
+		if (err == 0 && psize > 0) {
+			psize--;
+			err = sa_update(par_hdl,
+			    rac->rac_sa[ZPL_SIZE], &psize,
+			    sizeof (psize), tx);
+		}
+	}
+	if (err == 0 && is_dir) {
+		plinks = 0;
+		err = sa_lookup(par_hdl, rac->rac_sa[ZPL_LINKS],
+		    &plinks, sizeof (plinks));
+		if (err == 0 && plinks > 0) {
+			plinks--;
+			err = sa_update(par_hdl,
+			    rac->rac_sa[ZPL_LINKS], &plinks,
+			    sizeof (plinks), tx);
+		}
+	}
+	if (err == 0) {
+		gethrestime(&now);
+		REBASE_TIME_ENCODE(&now, times);
+		err = sa_update(par_hdl, rac->rac_sa[ZPL_MTIME],
+		    times, sizeof (times), tx);
+		if (err == 0)
+			err = sa_update(par_hdl,
+			    rac->rac_sa[ZPL_CTIME], times,
+			    sizeof (times), tx);
+	}
+
+	dmu_tx_commit(tx);
+out:
+	sa_handle_destroy(par_hdl);
+	sa_handle_destroy(obj_hdl);
+	if (err != 0)
+		return (err);
+
+	if (free_now)
+		err = rebase_apply_free_object(rac, ra->ra_obj);
+	return (err);
+}
+
+/*
+ * The apply driver. COPY actions apply first, in list order --
+ * the right changelist's path order, parents before children.
+ * UNLINK actions apply second, in REVERSE list order -- children
+ * before parents, so a deleted subtree empties bottom-up and a
+ * directory is bare by the time its own entry goes. Actions of
+ * the remaining types belong to the later apply phases and are
+ * counted as deferred; the tally line is a stable harness
+ * contract. When no applicable action exists the HEAD is not
  * even owned: a pure-diff rebase keeps working against a mounted
  * left until an apply phase actually has work there.
  */
@@ -6153,19 +6469,22 @@ rebase_apply(rebase_state_t *rs, const char *left_ds)
 {
 	rebase_apply_ctx_t rac;
 	rebase_action_t *ra;
-	uint64_t copies = 0, deferred = 0, applied = 0;
+	uint64_t copies = 0, unlinks = 0, deferred = 0;
+	uint64_t applied = 0;
 	int err;
 
 	for (ra = list_head(&rs->rs_manifest.rm_actions); ra != NULL;
 	    ra = list_next(&rs->rs_manifest.rm_actions, ra)) {
 		if (ra->ra_type == REBASE_ACTION_COPY)
 			copies++;
+		else if (ra->ra_type == REBASE_ACTION_UNLINK)
+			unlinks++;
 		else
 			deferred++;
 	}
-	if (copies == 0) {
-		zfs_dbgmsg("rebase: apply copies 0 deferred %llu",
-		    (u_longlong_t)deferred);
+	if (copies + unlinks == 0) {
+		zfs_dbgmsg("rebase: apply copies 0 unlinks 0 "
+		    "deferred %llu", (u_longlong_t)deferred);
 		return (0);
 	}
 
@@ -6206,11 +6525,31 @@ rebase_apply(rebase_state_t *rs, const char *left_ds)
 		}
 	}
 
+	for (ra = list_tail(&rs->rs_manifest.rm_actions);
+	    err == 0 && ra != NULL;
+	    ra = list_prev(&rs->rs_manifest.rm_actions, ra)) {
+		if (ra->ra_type != REBASE_ACTION_UNLINK)
+			continue;
+		if (rebase_apply_inject_stop_after != 0 &&
+		    applied >= rebase_apply_inject_stop_after) {
+			err = SET_ERROR(EINTR);
+			break;
+		}
+		err = rebase_apply_unlink(rs, &rac, ra);
+		if (err != 0) {
+			zfs_dbgmsg("rebase: apply unlink %s "
+			    "failed: %d", ra->ra_path, err);
+		} else {
+			applied++;
+		}
+	}
+
 	dmu_objset_disown(rac.rac_os, B_FALSE, FTAG);
 
 	if (err == 0) {
-		zfs_dbgmsg("rebase: apply copies %llu deferred %llu",
-		    (u_longlong_t)copies, (u_longlong_t)deferred);
+		zfs_dbgmsg("rebase: apply copies %llu unlinks %llu "
+		    "deferred %llu", (u_longlong_t)copies,
+		    (u_longlong_t)unlinks, (u_longlong_t)deferred);
 	}
 	return (err);
 }
