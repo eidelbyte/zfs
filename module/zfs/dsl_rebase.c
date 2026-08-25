@@ -34,6 +34,7 @@
 #include <sys/dsl_destroy.h>
 #include <sys/dsl_pool.h>
 #include <sys/dsl_dir.h>
+#include <sys/dsl_prop.h>
 #include <sys/dsl_scan.h>
 #include <sys/dmu.h>
 #include <sys/dmu_objset.h>
@@ -5919,6 +5920,301 @@ rebase_free_xattr_dir(objset_t *os, uint64_t xattr_obj, dmu_tx_t *tx)
 	return (dmu_object_free(os, xattr_obj, tx));
 }
 
+/*
+ * ==== Apply driver, phase 1: standalone additions ====
+ *
+ * Consume the manifest's REBASE_ACTION_COPY actions -- standalone
+ * right-only additions the merge decided on -- and materialize
+ * them in the left HEAD. The HEAD is owned for the duration:
+ * dmu_objset_own fails EBUSY on a mounted dataset, which is
+ * exactly the v1 requirement (a mounted left has cached znodes
+ * above the dnodes apply rewrites; the upstream analog is zfs
+ * rollback's refusal). Every read still comes from the immutable
+ * fence snapshots; only the owned HEAD is written.
+ *
+ * The action list was compiled from non-conflicting, left-silent
+ * decisions, so apply trusts it: a name already present at a COPY
+ * destination or a missing parent directory is an engine
+ * invariant violation, reported loudly, never patched around.
+ * On any failure the caller rolls the HEAD back to the left
+ * fence snapshot -- apply is all-or-nothing at the rebase level
+ * even though it commits many transactions.
+ */
+
+/*
+ * Resolve an action path's parent directory in the HEAD and point
+ * at the final name component. Parents are expected to exist:
+ * COPY actions arrive in path order, so a right-added directory
+ * is created before its children, and every other parent survives
+ * from base by the merge's own decision. An absent parent is a
+ * broken engine invariant, not input to tolerate.
+ */
+static int
+rebase_apply_parent(const rebase_apply_ctx_t *rac, const char *path,
+    uint64_t *parentp, const char **namep)
+{
+	char prefix[MAXPATHLEN];
+	const char *p = path, *slash;
+	size_t plen;
+	int err;
+
+	/*
+	 * Engine paths are rooted ("/dir/file"); the leading slash
+	 * is not a component. (The first box run failed EVERY
+	 * root-level copy on exactly this line.)
+	 */
+	while (*p == '/')
+		p++;
+
+	slash = strrchr(p, '/');
+	if (slash == NULL) {
+		if (*p == '\0')
+			return (SET_ERROR(EIO));
+		*parentp = rac->rac_root;
+		*namep = p;
+		return (0);
+	}
+	*namep = slash + 1;
+
+	plen = (size_t)(slash - p);
+	if (plen == 0 || plen >= sizeof (prefix) || **namep == '\0')
+		return (SET_ERROR(EIO));
+	memcpy(prefix, p, plen);
+	prefix[plen] = '\0';
+
+	err = rebase_tree_lookup(rac->rac_os, rac->rac_root, prefix,
+	    parentp);
+	if (err != 0)
+		return (err);
+	if (*parentp == 0) {
+		zfs_dbgmsg("rebase: apply parent missing for %s",
+		    path);
+		return (SET_ERROR(EIO));
+	}
+	return (0);
+}
+
+/*
+ * Apply one COPY action: create the object in the HEAD from its
+ * right-snapshot source, enter it in its parent directory, and
+ * update the parent the way the ZPL create path would (entry
+ * count, link count for subdirectories, times). The bounded work
+ * -- attributes, dirent, parent bookkeeping -- shares one tx;
+ * data and xattrs follow through the helpers that own their own.
+ */
+static int
+rebase_apply_copy(rebase_state_t *rs, const rebase_apply_ctx_t *rac,
+    const rebase_action_t *ra)
+{
+	objset_t *src_os = rs->rs_right_os;
+	const sa_attr_type_t *src_sa = rs->rs_right_sa;
+	sa_handle_t *src_hdl, *par_hdl;
+	dmu_object_info_t doi;
+	dmu_tx_t *tx;
+	const char *name;
+	uint64_t parent_obj, new_obj, mode, val, dirent;
+	uint64_t psize, plinks, times[2];
+	inode_timespec_t now;
+	boolean_t is_dir;
+	int err;
+
+	err = rebase_apply_parent(rac, ra->ra_path, &parent_obj,
+	    &name);
+	if (err != 0)
+		return (err);
+
+	/* The merge said this name is free; verify it. */
+	err = zap_lookup(rac->rac_os, parent_obj, name, 8, 1, &val);
+	if (err == 0) {
+		zfs_dbgmsg("rebase: apply destination exists: %s",
+		    ra->ra_path);
+		return (SET_ERROR(EEXIST));
+	}
+	if (err != ENOENT)
+		return (err);
+
+	err = dmu_object_info(src_os, ra->ra_src_obj, &doi);
+	if (err != 0)
+		return (err);
+	is_dir = (doi.doi_type == DMU_OT_DIRECTORY_CONTENTS);
+
+	err = sa_handle_get(src_os, ra->ra_src_obj, NULL,
+	    SA_HDL_PRIVATE, &src_hdl);
+	if (err != 0)
+		return (err);
+	err = sa_lookup(src_hdl, src_sa[ZPL_MODE], &mode,
+	    sizeof (mode));
+	sa_handle_destroy(src_hdl);
+	if (err != 0)
+		return (err);
+
+	err = sa_handle_get(rac->rac_os, parent_obj, NULL,
+	    SA_HDL_PRIVATE, &par_hdl);
+	if (err != 0)
+		return (err);
+
+	tx = dmu_tx_create(rac->rac_os);
+	dmu_tx_hold_zap(tx, parent_obj, B_TRUE, name);
+	dmu_tx_hold_sa(tx, par_hdl, B_FALSE);
+	dmu_tx_hold_sa_create(tx, DN_BONUS_SIZE(DNODE_MIN_SIZE));
+	if (is_dir)
+		dmu_tx_hold_zap(tx, DMU_NEW_OBJECT, B_TRUE, NULL);
+	err = dmu_tx_assign(tx, DMU_TX_WAIT);
+	if (err != 0) {
+		dmu_tx_abort(tx);
+		sa_handle_destroy(par_hdl);
+		return (err);
+	}
+
+	err = rebase_copy_object(src_os, src_sa, ra->ra_src_obj,
+	    rac->rac_os, rac->rac_sa, parent_obj, &new_obj, tx);
+	if (err == 0) {
+		dirent = new_obj | (((mode >> 12) & 0xf) << 60);
+		err = zap_add(rac->rac_os, parent_obj, name, 8, 1,
+		    &dirent, tx);
+	}
+
+	/* Parent bookkeeping, as the ZPL create path leaves it. */
+	if (err == 0) {
+		psize = 0;
+		err = sa_lookup(par_hdl, rac->rac_sa[ZPL_SIZE],
+		    &psize, sizeof (psize));
+		if (err == 0) {
+			psize++;
+			err = sa_update(par_hdl,
+			    rac->rac_sa[ZPL_SIZE], &psize,
+			    sizeof (psize), tx);
+		}
+	}
+	if (err == 0 && is_dir) {
+		plinks = 0;
+		err = sa_lookup(par_hdl, rac->rac_sa[ZPL_LINKS],
+		    &plinks, sizeof (plinks));
+		if (err == 0) {
+			plinks++;
+			err = sa_update(par_hdl,
+			    rac->rac_sa[ZPL_LINKS], &plinks,
+			    sizeof (plinks), tx);
+		}
+	}
+	if (err == 0) {
+		gethrestime(&now);
+		REBASE_TIME_ENCODE(&now, times);
+		err = sa_update(par_hdl, rac->rac_sa[ZPL_MTIME],
+		    times, sizeof (times), tx);
+		if (err == 0)
+			err = sa_update(par_hdl,
+			    rac->rac_sa[ZPL_CTIME], times,
+			    sizeof (times), tx);
+	}
+
+	sa_handle_destroy(par_hdl);
+	dmu_tx_commit(tx);
+	if (err != 0)
+		return (err);
+
+	err = rebase_copy_data(src_os, ra->ra_src_obj, rac->rac_os,
+	    new_obj);
+	if (err == 0)
+		err = rebase_copy_xattrs(src_os, src_sa,
+		    ra->ra_src_obj, rac->rac_os, rac->rac_sa,
+		    new_obj, rac->rac_xattr_mode);
+	return (err);
+}
+
+/*
+ * Test instrumentation, following the upstream pause/cancel
+ * tunable precedent (zfs_livelist_condense_*). When
+ * rebase_apply_inject_stop_after is nonzero, the apply driver
+ * stops with EINTR before applying one more action than it
+ * allows -- the shape of a user cancel, exercising the automatic
+ * rollback to the left fence. When
+ * rebase_apply_inject_skip_rollback is also nonzero, the failure
+ * path leaves the rollback undone -- the shape of a crash that
+ * never reached cleanup, leaving the partial HEAD and the fence
+ * exactly as the abort flow will find them. Both are consulted
+ * only when nonzero; promotion to ZFS_MODULE_PARAM waits for a
+ * userland need.
+ */
+uint64_t rebase_apply_inject_stop_after = 0;
+int rebase_apply_inject_skip_rollback = 0;
+
+/*
+ * The phase-1 apply driver. COPY actions apply in list order,
+ * which is the right changelist's path order -- parents before
+ * children. Actions of the other types belong to the later apply
+ * phases and are counted as deferred; the tally line is a stable
+ * harness contract. When no COPY action exists the HEAD is not
+ * even owned: a pure-diff rebase keeps working against a mounted
+ * left until an apply phase actually has work there.
+ */
+static int
+rebase_apply(rebase_state_t *rs, const char *left_ds)
+{
+	rebase_apply_ctx_t rac;
+	rebase_action_t *ra;
+	uint64_t copies = 0, deferred = 0, applied = 0;
+	int err;
+
+	for (ra = list_head(&rs->rs_manifest.rm_actions); ra != NULL;
+	    ra = list_next(&rs->rs_manifest.rm_actions, ra)) {
+		if (ra->ra_type == REBASE_ACTION_COPY)
+			copies++;
+		else
+			deferred++;
+	}
+	if (copies == 0) {
+		zfs_dbgmsg("rebase: apply copies 0 deferred %llu",
+		    (u_longlong_t)deferred);
+		return (0);
+	}
+
+	err = dmu_objset_own(left_ds, DMU_OST_ZFS, B_FALSE, B_FALSE,
+	    FTAG, &rac.rac_os);
+	if (err != 0) {
+		zfs_dbgmsg("rebase: apply own %s failed: %d",
+		    left_ds, err);
+		return (err);
+	}
+	err = rebase_master_lookup(rac.rac_os, ZFS_ROOT_OBJ,
+	    &rac.rac_root);
+	if (err == 0)
+		err = rebase_sa_setup(rac.rac_os, &rac.rac_sa);
+	if (err == 0)
+		err = dsl_prop_get_integer(left_ds,
+		    zfs_prop_to_name(ZFS_PROP_XATTR),
+		    &rac.rac_xattr_mode, NULL);
+	if (err != 0)
+		zfs_dbgmsg("rebase: apply setup failed: %d", err);
+
+	for (ra = list_head(&rs->rs_manifest.rm_actions);
+	    err == 0 && ra != NULL;
+	    ra = list_next(&rs->rs_manifest.rm_actions, ra)) {
+		if (ra->ra_type != REBASE_ACTION_COPY)
+			continue;
+		if (rebase_apply_inject_stop_after != 0 &&
+		    applied >= rebase_apply_inject_stop_after) {
+			err = SET_ERROR(EINTR);
+			break;
+		}
+		err = rebase_apply_copy(rs, &rac, ra);
+		if (err != 0) {
+			zfs_dbgmsg("rebase: apply copy %s "
+			    "failed: %d", ra->ra_path, err);
+		} else {
+			applied++;
+		}
+	}
+
+	dmu_objset_disown(rac.rac_os, B_FALSE, FTAG);
+
+	if (err == 0) {
+		zfs_dbgmsg("rebase: apply copies %llu deferred %llu",
+		    (u_longlong_t)copies, (u_longlong_t)deferred);
+	}
+	return (err);
+}
+
 static const char *
 rebase_conflict_type_name(rebase_conflict_type_t type)
 {
@@ -6059,6 +6355,7 @@ dsl_rebase(const char *left_ds, const char *right_ds, nvlist_t *outnvl)
 	rebase_state_t state;
 	char *snapname, *right_snapname;
 	boolean_t right_is_head;
+	boolean_t apply_failed = B_FALSE;
 	int err;
 
 
@@ -6192,14 +6489,28 @@ dsl_rebase(const char *left_ds, const char *right_ds, nvlist_t *outnvl)
 		err = rebase_symlink_sweep(&state);
 
 	/*
-	 * The diff pipeline is complete: a successful rebase now
+	 * The diff pipeline is complete: a successful rebase
 	 * returns 0 with the summary manifest -- conflicts,
 	 * warnings, and counts, never the action list -- in outnvl.
-	 * The on-disk manifest (emit-part-2) and the apply epic
-	 * land here next.
+	 * The on-disk manifest (emit-part-2) lands here next.
 	 */
 	if (err == 0 && outnvl != NULL)
 		rebase_manifest_to_nvl(&state, outnvl);
+
+	/*
+	 * Apply, phase 1 of the epic: materialize the COPY actions
+	 * onto the left HEAD. Conflicted work compiled no actions,
+	 * so applying is safe whether or not the manifest carries
+	 * conflicts -- what is clean lands, the rest waits for
+	 * resolution. A failure here schedules a rollback to the
+	 * left fence at the exit ladder, where no holds remain to
+	 * make the rollback sync task EBUSY against ourselves.
+	 */
+	if (err == 0) {
+		err = rebase_apply(&state, left_ds);
+		if (err != 0)
+			apply_failed = B_TRUE;
+	}
 
 	rebase_state_teardown(&state);
 long_rele:
@@ -6221,17 +6532,45 @@ rele:
 	rebase_rele(dp, &state);
 destroy_snaps:
 	/*
-	 * While the engine is diff-only, a rebase leaves nothing
-	 * behind: both fence-posts are destroyed on every exit. Once
-	 * the apply phase lands, the success path keeps them until
-	 * finish/abort. (Destruction is a sync task: no holds may be
-	 * outstanding.)
+	 * The LEFT fence survives every exit path from the apply
+	 * era on (user decision 2026-08-22): it is the rollback
+	 * anchor on failure and the user's revert point on success,
+	 * and a present fence is the one in-progress marker -- a
+	 * second rebase EEXISTs until finish or abort clears it.
+	 * One lifecycle path, no clean-versus-conflicted special
+	 * case, and deliberately no early-failure special case
+	 * either. The right fence-post is still destroyed here;
+	 * the teardown issue owns its final lifecycle. (Rollback
+	 * and destruction are sync tasks: no holds outstanding.)
 	 */
 	if (right_snapname != NULL) {
 		rebase_destroy_snap(right_snapname, &err);
 		kmem_strfree(right_snapname);
 	}
-	rebase_destroy_snap(snapname, &err);
+	if (apply_failed && rebase_apply_inject_skip_rollback != 0) {
+		/* Simulating a crash: partial HEAD, fence intact. */
+		zfs_dbgmsg("rebase: rollback of %s skipped by "
+		    "injection", left_ds);
+	} else if (apply_failed) {
+		/*
+		 * The rollback sync task unconditionally records the
+		 * target snapshot in the result nvlist -- a NULL
+		 * result is not merely unwanted, it VERIFYs in the
+		 * sync thread (the first box run of the apply path
+		 * proved it the hard way). Upstream callers always
+		 * pass a real nvlist; so do we, and drop it.
+		 */
+		nvlist_t *rnvl = fnvlist_alloc();
+		int rerr;
+
+		rerr = dsl_dataset_rollback(left_ds, snapname, NULL,
+		    rnvl);
+		nvlist_free(rnvl);
+		if (rerr != 0) {
+			zfs_dbgmsg("rebase: rollback of %s to %s "
+			    "failed: %d", left_ds, snapname, rerr);
+		}
+	}
 	kmem_strfree(snapname);
 	return (err);
 }

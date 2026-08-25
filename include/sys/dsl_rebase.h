@@ -508,6 +508,19 @@ typedef struct rebase_state {
 } rebase_state_t;
 
 /*
+ * The apply phases' write-side context: the OWNED left HEAD (the
+ * one objset the rebase mutates; every read source stays an
+ * immutable snapshot in rebase_state_t) with its own root,
+ * attribute table, and xattr= property value.
+ */
+typedef struct rebase_apply_ctx {
+	objset_t	*rac_os;	/* owned left HEAD		*/
+	sa_attr_type_t	*rac_sa;	/* its attribute table		*/
+	uint64_t	rac_root;	/* its root directory object	*/
+	uint64_t	rac_xattr_mode;	/* its xattr= property value	*/
+} rebase_apply_ctx_t;
+
+/*
  * MASTER_NODE ZAP keys for rebase-in-progress metadata.
  */
 #define	ZFS_REBASE_MANIFEST	"org.openzfs:rebase_manifest"
