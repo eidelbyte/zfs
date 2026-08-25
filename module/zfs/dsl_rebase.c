@@ -4825,6 +4825,10 @@ rebase_consistency_sweep(rebase_state_t *rs)
 				 * an in-place WRITE, and silence
 				 * is silence -- the other rows'
 				 * removals do the link arithmetic.
+				 * A sever carries the base pool
+				 * object in ra_obj so apply can
+				 * cross-check the entry it
+				 * repoints.
 				 */
 				if (rc == NULL) {
 					break;
@@ -4834,7 +4838,9 @@ rebase_consistency_sweep(rebase_state_t *rs)
 					    REBASE_ACTION_SEVER,
 					    rpp->rpp_path,
 					    rpp->rpp_pathlen,
-					    0, REBASE_SRC_RIGHT,
+					    base_lp != NULL ?
+					    base_lp->rlp_obj : 0,
+					    REBASE_SRC_RIGHT,
 					    rc->rc_obj);
 				} else if (rc->rc_content_op ==
 				    REBASE_CONTENT_EDIT ||
@@ -5445,32 +5451,44 @@ rebase_symlink_sweep(rebase_state_t *rs)
 }
 
 /*
- * Copy a ZPL object from one objset to another: allocate the
- * right DMU object kind (ZAP for directories, plain file
- * otherwise -- symlinks and devices are plain-file dnodes whose
- * nature lives in their SA attributes), copy the SA attributes
- * the source actually has, and copy file data block by block.
- * Attributes are read with the SOURCE's attribute table and
- * written with the DESTINATION's -- the two objsets registered
- * their SA layouts independently. Only attributes present on the
- * source are written: stamping defaults the source never carried
- * (a zero ZPL_PROJID, say) would invent state the ZPL write path
- * would not have.
+ * Destination fields an in-place WRITE keeps. A NULL member
+ * means "take the source's value"; the fresh-copy path passes no
+ * struct at all. ZPL_LINKS is pool truth and ZPL_GEN is lineage
+ * truth: an edited object must read as the same incarnation
+ * afterward, or every future diff of the result would see a
+ * recycle where the user made an edit. ZPL_SIZE is kept only for
+ * directories, whose entry count belongs to the child actions.
+ */
+typedef struct rebase_stamp_keep {
+	const uint64_t	*rsk_links;
+	const uint64_t	*rsk_gen;
+	const uint64_t	*rsk_size;
+} rebase_stamp_keep_t;
+
+/*
+ * Stamp one object's SA attributes from a source object in
+ * another objset: copy the attributes the source actually has,
+ * reading with the SOURCE's attribute table and writing with the
+ * DESTINATION's -- the two objsets registered their SA layouts
+ * independently. Only attributes present on the source are
+ * written: stamping defaults the source never carried (a zero
+ * ZPL_PROJID, say) would invent state the ZPL write path would
+ * not have.
  *
  * ZPL_PARENT is overridden to parent_obj. ZPL_XATTR is left
  * unset and ZPL_DXATTR is deliberately NOT copied: xattrs cross
  * over logically through rebase_copy_xattrs, never as raw
- * representation. ZPL_LINKS is copied as-is; the apply phases own
- * link-count truth and adjust it as LINK actions land.
- *
- * The caller adds the directory entry, copies xattrs, and
- * recurses into directory children.
+ * representation. The keep overrides protect destination truths
+ * during in-place writes; with keep NULL everything is
+ * source-valued (ZPL_LINKS copied as-is -- the apply phases own
+ * link-count truth and adjust it as LINK actions land).
  */
 static int
-rebase_copy_object(objset_t *src_os, const sa_attr_type_t *src_tbl,
-    uint64_t src_obj, objset_t *dst_os,
-    const sa_attr_type_t *dst_tbl, uint64_t parent_obj,
-    uint64_t *dst_objp, dmu_tx_t *tx)
+rebase_stamp_from_source(objset_t *src_os,
+    const sa_attr_type_t *src_tbl, uint64_t src_obj,
+    sa_handle_t *dst_hdl, const sa_attr_type_t *dst_tbl,
+    uint64_t parent_obj, const rebase_stamp_keep_t *keep,
+    dmu_tx_t *tx)
 {
 	static const int fixed[] = {
 		ZPL_MODE, ZPL_SIZE, ZPL_GEN, ZPL_UID, ZPL_GID,
@@ -5485,46 +5503,36 @@ rebase_copy_object(objset_t *src_os, const sa_attr_type_t *src_tbl,
 	uint64_t pair_val[4][2];
 	void *var_buf[2] = { NULL, NULL };
 	int var_sz[2] = { 0, 0 };
-	dmu_object_info_t doi;
-	sa_handle_t *src_hdl = NULL, *dst_hdl = NULL;
+	sa_handle_t *src_hdl = NULL;
 	sa_bulk_attr_t attrs[20];
-	uint64_t dst_obj, parent, xattr_obj;
+	uint64_t parent, xattr_obj;
 	int cnt = 0;
 	int err;
-
-	*dst_objp = 0;
-
-	err = dmu_object_info(src_os, src_obj, &doi);
-	if (err != 0)
-		return (err);
-
-	if (doi.doi_type == DMU_OT_DIRECTORY_CONTENTS) {
-		/*
-		 * Zero norm flags: the preconditions pin
-		 * normalization=none on every dataset involved.
-		 */
-		dst_obj = zap_create_norm(dst_os, 0,
-		    DMU_OT_DIRECTORY_CONTENTS, DMU_OT_SA,
-		    DN_BONUS_SIZE(DNODE_MIN_SIZE), tx);
-	} else {
-		dst_obj = dmu_object_alloc(dst_os,
-		    DMU_OT_PLAIN_FILE_CONTENTS, 0, DMU_OT_SA,
-		    DN_BONUS_SIZE(DNODE_MIN_SIZE), tx);
-	}
 
 	err = sa_handle_get(src_os, src_obj, NULL, SA_HDL_PRIVATE,
 	    &src_hdl);
 	if (err != 0)
 		return (err);
-	err = sa_handle_get(dst_os, dst_obj, NULL, SA_HDL_PRIVATE,
-	    &dst_hdl);
-	if (err != 0) {
-		sa_handle_destroy(src_hdl);
-		return (err);
-	}
 
 	for (size_t i = 0; i < sizeof (fixed) / sizeof (fixed[0]);
 	    i++) {
+		const uint64_t *ov = NULL;
+
+		if (keep != NULL) {
+			if (fixed[i] == ZPL_LINKS)
+				ov = keep->rsk_links;
+			else if (fixed[i] == ZPL_GEN)
+				ov = keep->rsk_gen;
+			else if (fixed[i] == ZPL_SIZE)
+				ov = keep->rsk_size;
+		}
+		if (ov != NULL) {
+			fixed_val[i] = *ov;
+			SA_ADD_BULK_ATTR(attrs, cnt,
+			    dst_tbl[fixed[i]], NULL, &fixed_val[i],
+			    sizeof (fixed_val[i]));
+			continue;
+		}
 		err = sa_lookup(src_hdl, src_tbl[fixed[i]],
 		    &fixed_val[i], sizeof (fixed_val[i]));
 		if (err == ENOENT) {
@@ -5581,13 +5589,61 @@ rebase_copy_object(objset_t *src_os, const sa_attr_type_t *src_tbl,
 	err = sa_replace_all_by_template(dst_hdl, attrs, cnt, tx);
 
 out:
-	sa_handle_destroy(dst_hdl);
 	sa_handle_destroy(src_hdl);
 	for (size_t i = 0; i < sizeof (vars) / sizeof (vars[0]);
 	    i++) {
 		if (var_buf[i] != NULL)
 			vmem_free(var_buf[i], var_sz[i]);
 	}
+	return (err);
+}
+
+/*
+ * Copy a ZPL object from one objset to another: allocate the
+ * right DMU object kind (ZAP for directories, plain file
+ * otherwise -- symlinks and devices are plain-file dnodes whose
+ * nature lives in their SA attributes) and stamp its attributes
+ * from the source. The caller adds the directory entry, copies
+ * file data and xattrs, and recurses into directory children.
+ */
+static int
+rebase_copy_object(objset_t *src_os, const sa_attr_type_t *src_tbl,
+    uint64_t src_obj, objset_t *dst_os,
+    const sa_attr_type_t *dst_tbl, uint64_t parent_obj,
+    uint64_t *dst_objp, dmu_tx_t *tx)
+{
+	dmu_object_info_t doi;
+	sa_handle_t *dst_hdl;
+	uint64_t dst_obj;
+	int err;
+
+	*dst_objp = 0;
+
+	err = dmu_object_info(src_os, src_obj, &doi);
+	if (err != 0)
+		return (err);
+
+	if (doi.doi_type == DMU_OT_DIRECTORY_CONTENTS) {
+		/*
+		 * Zero norm flags: the preconditions pin
+		 * normalization=none on every dataset involved.
+		 */
+		dst_obj = zap_create_norm(dst_os, 0,
+		    DMU_OT_DIRECTORY_CONTENTS, DMU_OT_SA,
+		    DN_BONUS_SIZE(DNODE_MIN_SIZE), tx);
+	} else {
+		dst_obj = dmu_object_alloc(dst_os,
+		    DMU_OT_PLAIN_FILE_CONTENTS, 0, DMU_OT_SA,
+		    DN_BONUS_SIZE(DNODE_MIN_SIZE), tx);
+	}
+
+	err = sa_handle_get(dst_os, dst_obj, NULL, SA_HDL_PRIVATE,
+	    &dst_hdl);
+	if (err != 0)
+		return (err);
+	err = rebase_stamp_from_source(src_os, src_tbl, src_obj,
+	    dst_hdl, dst_tbl, parent_obj, NULL, tx);
+	sa_handle_destroy(dst_hdl);
 	if (err != 0)
 		return (err);
 
@@ -6230,6 +6286,36 @@ rebase_apply_link_pending(rebase_state_t *rs, uint64_t obj)
 }
 
 /*
+ * Count tx free holds for one xattr directory and its value
+ * children. Shared by the object-free and in-place-write paths;
+ * the caller assigns and then walks the same set again through
+ * rebase_free_xattr_dir, which does the actual destroys.
+ */
+static int
+rebase_hold_xattr_frees(objset_t *os, uint64_t xattr_obj,
+    dmu_tx_t *tx)
+{
+	zap_cursor_t zc;
+	zap_attribute_t *za;
+	int err;
+
+	dmu_tx_hold_free(tx, xattr_obj, 0, DMU_OBJECT_END);
+	za = zap_attribute_alloc();
+	for (zap_cursor_init(&zc, os, xattr_obj);
+	    (err = zap_cursor_retrieve(&zc, za)) == 0;
+	    zap_cursor_advance(&zc)) {
+		dmu_tx_hold_free(tx,
+		    ZFS_DIRENT_OBJ(za->za_first_integer),
+		    0, DMU_OBJECT_END);
+	}
+	zap_cursor_fini(&zc);
+	zap_attribute_free(za);
+	if (err == ENOENT)
+		err = 0;
+	return (err);
+}
+
+/*
  * Free one dead object in the HEAD: its xattr satellite state
  * first (the hidden directory and every value child), then the
  * object itself -- zap_destroy for directories, dmu_object_free
@@ -6267,21 +6353,8 @@ rebase_apply_free_object(const rebase_apply_ctx_t *rac, uint64_t obj)
 	tx = dmu_tx_create(rac->rac_os);
 	dmu_tx_hold_free(tx, obj, 0, DMU_OBJECT_END);
 	if (xattr_obj != 0) {
-		zap_cursor_t zc;
-		zap_attribute_t *za = zap_attribute_alloc();
-
-		dmu_tx_hold_free(tx, xattr_obj, 0, DMU_OBJECT_END);
-		for (zap_cursor_init(&zc, rac->rac_os, xattr_obj);
-		    (err = zap_cursor_retrieve(&zc, za)) == 0;
-		    zap_cursor_advance(&zc)) {
-			dmu_tx_hold_free(tx,
-			    ZFS_DIRENT_OBJ(za->za_first_integer),
-			    0, DMU_OBJECT_END);
-		}
-		zap_cursor_fini(&zc);
-		zap_attribute_free(za);
-		if (err == ENOENT)
-			err = 0;
+		err = rebase_hold_xattr_frees(rac->rac_os,
+		    xattr_obj, tx);
 		if (err != 0) {
 			dmu_tx_abort(tx);
 			return (err);
@@ -6302,6 +6375,55 @@ rebase_apply_free_object(const rebase_apply_ctx_t *rac, uint64_t obj)
 		else
 			err = dmu_object_free(rac->rac_os, obj, tx);
 	}
+	dmu_tx_commit(tx);
+	return (err);
+}
+
+/*
+ * Free a live destination's xattr satellite state ahead of an
+ * in-place rewrite: the hidden directory and its value children
+ * are separate objects that neither the reclaim nor the SA
+ * re-stamp would touch -- without this they leak the moment the
+ * SA stops pointing at them. The SA references themselves die
+ * with the full re-stamp (fresh template, ZPL_XATTR zero, no
+ * ZPL_DXATTR), which is what lets rebase_write_xattrs keep its
+ * fresh-object contract. Owns its transaction.
+ */
+static int
+rebase_apply_strip_xattrs(const rebase_apply_ctx_t *rac,
+    uint64_t obj)
+{
+	sa_handle_t *hdl;
+	uint64_t xattr_obj = 0;
+	dmu_tx_t *tx;
+	int err;
+
+	err = sa_handle_get(rac->rac_os, obj, NULL, SA_HDL_PRIVATE,
+	    &hdl);
+	if (err != 0)
+		return (err);
+	err = sa_lookup(hdl, rac->rac_sa[ZPL_XATTR], &xattr_obj,
+	    sizeof (xattr_obj));
+	sa_handle_destroy(hdl);
+	if (err == ENOENT) {
+		err = 0;
+		xattr_obj = 0;
+	}
+	if (err != 0 || xattr_obj == 0)
+		return (err);
+
+	tx = dmu_tx_create(rac->rac_os);
+	err = rebase_hold_xattr_frees(rac->rac_os, xattr_obj, tx);
+	if (err != 0) {
+		dmu_tx_abort(tx);
+		return (err);
+	}
+	err = dmu_tx_assign(tx, DMU_TX_WAIT);
+	if (err != 0) {
+		dmu_tx_abort(tx);
+		return (err);
+	}
+	err = rebase_free_xattr_dir(rac->rac_os, xattr_obj, tx);
 	dmu_tx_commit(tx);
 	return (err);
 }
@@ -6453,23 +6575,358 @@ out:
 }
 
 /*
- * The apply driver. COPY actions apply first, in list order --
- * the right changelist's path order, parents before children.
- * UNLINK actions apply second, in REVERSE list order -- children
- * before parents, so a deleted subtree empties bottom-up and a
- * directory is bare by the time its own entry goes. Actions of
- * the remaining types belong to the later apply phases and are
- * counted as deferred; the tally line is a stable harness
- * contract. When no applicable action exists the HEAD is not
- * even owned: a pure-diff rebase keeps working against a mounted
- * left until an apply phase actually has work there.
+ * Does a LINK action target this path? A WRITE whose destination
+ * name does not exist yet is not a failure when the LINK that
+ * will create it is still deferred (MOVE_EDIT and novel-pool
+ * shapes emit LINK and WRITE for the same path; list order puts
+ * the LINK first, so once apply-structural lands the WRITE finds
+ * its target). With no such LINK the action compiler contradicted
+ * itself and the caller errors.
+ */
+static boolean_t
+rebase_apply_write_pending(rebase_state_t *rs, const char *path)
+{
+	rebase_action_t *ra;
+
+	for (ra = list_head(&rs->rs_manifest.rm_actions); ra != NULL;
+	    ra = list_next(&rs->rs_manifest.rm_actions, ra)) {
+		if (ra->ra_type == REBASE_ACTION_LINK &&
+		    strcmp(ra->ra_path, path) == 0)
+			return (B_TRUE);
+	}
+	return (B_FALSE);
+}
+
+/*
+ * Apply one WRITE action: materialize right's content state --
+ * data, attributes, xattrs -- into the destination object IN
+ * PLACE. The object number never changes: right's numbers are
+ * objset-local and unreproducible, and the canonical branch's
+ * identity space is left's, so an edit that was really a
+ * delete-create on right still lands as this object's next state
+ * (the walker collapsed the distinction long before apply; see
+ * rebase_content_diff). ZPL_LINKS, ZPL_GEN, and ZPL_PARENT are
+ * the destination's and survive; a directory additionally keeps
+ * ZPL_SIZE and its ZAP, taking only attributes and xattrs from
+ * the source. Kind flips among non-directories ride
+ * dmu_object_reclaim (same object number, new type -- the zfs
+ * receive precedent); flips that change directory-ness are
+ * refused, because their child actions sit in the wrong pass. A
+ * group WRITE arrives with ra_obj set to the shared pool dnode
+ * and lands once for every member name.
+ */
+static int
+rebase_apply_write(rebase_state_t *rs, const rebase_apply_ctx_t *rac,
+    const rebase_action_t *ra, boolean_t *deferredp)
+{
+	objset_t *src_os = rs->rs_right_os;
+	const sa_attr_type_t *src_sa = rs->rs_right_sa;
+	dmu_object_info_t src_doi, dst_doi;
+	rebase_stamp_keep_t keep;
+	sa_handle_t *hdl;
+	dmu_tx_t *tx;
+	uint64_t dst_obj, links, gen, parent, size = 0;
+	boolean_t src_isdir, dst_isdir;
+	int err;
+
+	*deferredp = B_FALSE;
+
+	dst_obj = ra->ra_obj;
+	if (dst_obj == 0) {
+		err = rebase_tree_lookup(rac->rac_os, rac->rac_root,
+		    ra->ra_path, &dst_obj);
+		if (err != 0)
+			return (err);
+		if (dst_obj == 0) {
+			if (rebase_apply_write_pending(rs,
+			    ra->ra_path)) {
+				zfs_dbgmsg("rebase: apply write "
+				    "deferred: %s", ra->ra_path);
+				*deferredp = B_TRUE;
+				return (0);
+			}
+			zfs_dbgmsg("rebase: apply write target "
+			    "missing: %s", ra->ra_path);
+			return (SET_ERROR(EIO));
+		}
+	}
+
+	err = dmu_object_info(src_os, ra->ra_src_obj, &src_doi);
+	if (err == 0)
+		err = dmu_object_info(rac->rac_os, dst_obj,
+		    &dst_doi);
+	if (err != 0)
+		return (err);
+	src_isdir = (src_doi.doi_type == DMU_OT_DIRECTORY_CONTENTS);
+	dst_isdir = (dst_doi.doi_type == DMU_OT_DIRECTORY_CONTENTS);
+	if (src_isdir != dst_isdir) {
+		zfs_dbgmsg("rebase: apply write dir flip refused: "
+		    "%s", ra->ra_path);
+		return (SET_ERROR(EOPNOTSUPP));
+	}
+
+	/* The destination truths an in-place write must not lose. */
+	err = sa_handle_get(rac->rac_os, dst_obj, NULL,
+	    SA_HDL_PRIVATE, &hdl);
+	if (err != 0)
+		return (err);
+	err = sa_lookup(hdl, rac->rac_sa[ZPL_LINKS], &links,
+	    sizeof (links));
+	if (err == 0)
+		err = sa_lookup(hdl, rac->rac_sa[ZPL_GEN], &gen,
+		    sizeof (gen));
+	if (err == 0)
+		err = sa_lookup(hdl, rac->rac_sa[ZPL_PARENT],
+		    &parent, sizeof (parent));
+	if (err == 0 && dst_isdir)
+		err = sa_lookup(hdl, rac->rac_sa[ZPL_SIZE], &size,
+		    sizeof (size));
+	sa_handle_destroy(hdl);
+	if (err != 0)
+		return (err);
+
+	err = rebase_apply_strip_xattrs(rac, dst_obj);
+	if (err != 0)
+		return (err);
+
+	memset(&keep, 0, sizeof (keep));
+	keep.rsk_links = &links;
+	keep.rsk_gen = &gen;
+
+	if (dst_isdir) {
+		/*
+		 * Attributes and xattrs only: entries are the
+		 * child actions' business and ZPL_SIZE follows
+		 * them, so both stay the destination's.
+		 */
+		keep.rsk_size = &size;
+		err = sa_handle_get(rac->rac_os, dst_obj, NULL,
+		    SA_HDL_PRIVATE, &hdl);
+		if (err != 0)
+			return (err);
+		tx = dmu_tx_create(rac->rac_os);
+		dmu_tx_hold_sa(tx, hdl, B_TRUE);
+		err = dmu_tx_assign(tx, DMU_TX_WAIT);
+		if (err != 0) {
+			dmu_tx_abort(tx);
+			sa_handle_destroy(hdl);
+			return (err);
+		}
+		err = rebase_stamp_from_source(src_os, src_sa,
+		    ra->ra_src_obj, hdl, rac->rac_sa, parent,
+		    &keep, tx);
+		dmu_tx_commit(tx);
+		sa_handle_destroy(hdl);
+	} else {
+		tx = dmu_tx_create(rac->rac_os);
+		dmu_tx_hold_bonus(tx, dst_obj);
+		dmu_tx_hold_write(tx, dst_obj, 0, 0);
+		dmu_tx_hold_sa_create(tx,
+		    DN_BONUS_SIZE(DNODE_MIN_SIZE));
+		err = dmu_tx_assign(tx, DMU_TX_WAIT);
+		if (err != 0) {
+			dmu_tx_abort(tx);
+			return (err);
+		}
+		err = dmu_object_reclaim(rac->rac_os, dst_obj,
+		    DMU_OT_PLAIN_FILE_CONTENTS,
+		    src_doi.doi_data_block_size, DMU_OT_SA,
+		    DN_BONUS_SIZE(DNODE_MIN_SIZE), tx);
+		if (err == 0)
+			err = sa_handle_get(rac->rac_os, dst_obj,
+			    NULL, SA_HDL_PRIVATE, &hdl);
+		if (err == 0) {
+			err = rebase_stamp_from_source(src_os,
+			    src_sa, ra->ra_src_obj, hdl,
+			    rac->rac_sa, parent, &keep, tx);
+			sa_handle_destroy(hdl);
+		}
+		dmu_tx_commit(tx);
+		if (err == 0)
+			err = rebase_copy_data(src_os,
+			    ra->ra_src_obj, rac->rac_os, dst_obj);
+	}
+	if (err == 0)
+		err = rebase_copy_xattrs(src_os, src_sa,
+		    ra->ra_src_obj, rac->rac_os, rac->rac_sa,
+		    dst_obj, rac->rac_xattr_mode);
+	return (err);
+}
+
+/*
+ * Apply one SEVER action: this name leaves its linkpool with
+ * novel standalone content. Identity change is explicit here --
+ * a fresh object is allocated and stamped from right (the one
+ * place apply mints a new dnode outside COPY), the directory
+ * entry is repointed in place, and the old pool object loses a
+ * link. When that was the last name the object dies right here,
+ * behind the same pending-LINK tripwire as UNLINK: an
+ * all-members-sever pool has no UNLINK row to carry
+ * ra_frees_object, so the sever path owns that free or nobody
+ * does. ra_obj carries the base pool object as a cross-check on
+ * the entry being repointed; the parent keeps its entry count
+ * (a repoint, not an add) but takes fresh times.
+ */
+static int
+rebase_apply_sever(rebase_state_t *rs, const rebase_apply_ctx_t *rac,
+    const rebase_action_t *ra)
+{
+	objset_t *src_os = rs->rs_right_os;
+	const sa_attr_type_t *src_sa = rs->rs_right_sa;
+	sa_handle_t *src_hdl, *par_hdl, *old_hdl;
+	dmu_object_info_t doi;
+	dmu_tx_t *tx;
+	const char *name;
+	uint64_t parent_obj, old_obj, new_obj, mode, val, dirent;
+	uint64_t links, times[2];
+	inode_timespec_t now;
+	boolean_t is_dir;
+	int err;
+
+	err = rebase_apply_parent(rac, ra->ra_path, &parent_obj,
+	    &name);
+	if (err != 0)
+		return (err);
+
+	err = zap_lookup(rac->rac_os, parent_obj, name, 8, 1, &val);
+	if (err == ENOENT) {
+		zfs_dbgmsg("rebase: apply sever target missing: %s",
+		    ra->ra_path);
+		return (SET_ERROR(EIO));
+	}
+	if (err != 0)
+		return (err);
+	old_obj = ZFS_DIRENT_OBJ(val);
+	if (ra->ra_obj != 0 && old_obj != ra->ra_obj) {
+		zfs_dbgmsg("rebase: apply sever entry mismatch: %s",
+		    ra->ra_path);
+		return (SET_ERROR(EIO));
+	}
+
+	err = dmu_object_info(src_os, ra->ra_src_obj, &doi);
+	if (err != 0)
+		return (err);
+	is_dir = (doi.doi_type == DMU_OT_DIRECTORY_CONTENTS);
+
+	err = sa_handle_get(src_os, ra->ra_src_obj, NULL,
+	    SA_HDL_PRIVATE, &src_hdl);
+	if (err != 0)
+		return (err);
+	err = sa_lookup(src_hdl, src_sa[ZPL_MODE], &mode,
+	    sizeof (mode));
+	sa_handle_destroy(src_hdl);
+	if (err != 0)
+		return (err);
+
+	err = sa_handle_get(rac->rac_os, parent_obj, NULL,
+	    SA_HDL_PRIVATE, &par_hdl);
+	if (err != 0)
+		return (err);
+	err = sa_handle_get(rac->rac_os, old_obj, NULL,
+	    SA_HDL_PRIVATE, &old_hdl);
+	if (err != 0) {
+		sa_handle_destroy(par_hdl);
+		return (err);
+	}
+	err = sa_lookup(old_hdl, rac->rac_sa[ZPL_LINKS], &links,
+	    sizeof (links));
+	if (err == 0 && links == 0) {
+		zfs_dbgmsg("rebase: apply sever of unlinked object "
+		    "at %s", ra->ra_path);
+		err = SET_ERROR(EIO);
+	}
+	if (err != 0) {
+		sa_handle_destroy(old_hdl);
+		sa_handle_destroy(par_hdl);
+		return (err);
+	}
+
+	tx = dmu_tx_create(rac->rac_os);
+	dmu_tx_hold_zap(tx, parent_obj, B_TRUE, name);
+	dmu_tx_hold_sa(tx, par_hdl, B_FALSE);
+	dmu_tx_hold_sa(tx, old_hdl, B_FALSE);
+	dmu_tx_hold_sa_create(tx, DN_BONUS_SIZE(DNODE_MIN_SIZE));
+	if (is_dir)
+		dmu_tx_hold_zap(tx, DMU_NEW_OBJECT, B_TRUE, NULL);
+	err = dmu_tx_assign(tx, DMU_TX_WAIT);
+	if (err != 0) {
+		dmu_tx_abort(tx);
+		sa_handle_destroy(old_hdl);
+		sa_handle_destroy(par_hdl);
+		return (err);
+	}
+
+	err = rebase_copy_object(src_os, src_sa, ra->ra_src_obj,
+	    rac->rac_os, rac->rac_sa, parent_obj, &new_obj, tx);
+	if (err == 0) {
+		dirent = new_obj | (((mode >> 12) & 0xf) << 60);
+		err = zap_update(rac->rac_os, parent_obj, name, 8, 1,
+		    &dirent, tx);
+	}
+	if (err == 0) {
+		links--;
+		err = sa_update(old_hdl, rac->rac_sa[ZPL_LINKS],
+		    &links, sizeof (links), tx);
+	}
+	if (err == 0) {
+		gethrestime(&now);
+		REBASE_TIME_ENCODE(&now, times);
+		err = sa_update(par_hdl, rac->rac_sa[ZPL_MTIME],
+		    times, sizeof (times), tx);
+		if (err == 0)
+			err = sa_update(par_hdl,
+			    rac->rac_sa[ZPL_CTIME], times,
+			    sizeof (times), tx);
+	}
+
+	sa_handle_destroy(old_hdl);
+	sa_handle_destroy(par_hdl);
+	dmu_tx_commit(tx);
+	if (err != 0)
+		return (err);
+
+	err = rebase_copy_data(src_os, ra->ra_src_obj, rac->rac_os,
+	    new_obj);
+	if (err == 0)
+		err = rebase_copy_xattrs(src_os, src_sa,
+		    ra->ra_src_obj, rac->rac_os, rac->rac_sa,
+		    new_obj, rac->rac_xattr_mode);
+	if (err != 0)
+		return (err);
+
+	if (links == 0) {
+		if (rebase_apply_link_pending(rs, old_obj)) {
+			zfs_dbgmsg("rebase: apply sever leaves "
+			    "object %llu for a pending link",
+			    (u_longlong_t)old_obj);
+			return (0);
+		}
+		err = rebase_apply_free_object(rac, old_obj);
+	}
+	return (err);
+}
+
+/*
+ * The apply driver. Pass one applies COPY, WRITE, and SEVER
+ * actions in list order -- the emit order puts parents before
+ * children and a path's LINK before its WRITE. Pass two applies
+ * UNLINK actions in REVERSE list order -- children before
+ * parents, so a deleted subtree empties bottom-up and a
+ * directory is bare by the time its own entry goes. LINK actions
+ * belong to apply-structural and are counted as deferred, and a
+ * WRITE whose destination waits on a deferred LINK moves itself
+ * into that bucket at run time; the tally line is a stable
+ * harness contract. When no applicable action exists the HEAD is
+ * not even owned: a pure-diff rebase keeps working against a
+ * mounted left until an apply phase actually has work there.
  */
 static int
 rebase_apply(rebase_state_t *rs, const char *left_ds)
 {
 	rebase_apply_ctx_t rac;
 	rebase_action_t *ra;
-	uint64_t copies = 0, unlinks = 0, deferred = 0;
+	uint64_t copies = 0, writes = 0, severs = 0, unlinks = 0;
+	uint64_t deferred = 0;
 	uint64_t applied = 0;
 	int err;
 
@@ -6477,14 +6934,19 @@ rebase_apply(rebase_state_t *rs, const char *left_ds)
 	    ra = list_next(&rs->rs_manifest.rm_actions, ra)) {
 		if (ra->ra_type == REBASE_ACTION_COPY)
 			copies++;
+		else if (ra->ra_type == REBASE_ACTION_WRITE)
+			writes++;
+		else if (ra->ra_type == REBASE_ACTION_SEVER)
+			severs++;
 		else if (ra->ra_type == REBASE_ACTION_UNLINK)
 			unlinks++;
 		else
 			deferred++;
 	}
-	if (copies + unlinks == 0) {
-		zfs_dbgmsg("rebase: apply copies 0 unlinks 0 "
-		    "deferred %llu", (u_longlong_t)deferred);
+	if (copies + writes + severs + unlinks == 0) {
+		zfs_dbgmsg("rebase: apply copies 0 writes 0 "
+		    "severs 0 unlinks 0 deferred %llu",
+		    (u_longlong_t)deferred);
 		return (0);
 	}
 
@@ -6509,20 +6971,43 @@ rebase_apply(rebase_state_t *rs, const char *left_ds)
 	for (ra = list_head(&rs->rs_manifest.rm_actions);
 	    err == 0 && ra != NULL;
 	    ra = list_next(&rs->rs_manifest.rm_actions, ra)) {
-		if (ra->ra_type != REBASE_ACTION_COPY)
+		if (ra->ra_type != REBASE_ACTION_COPY &&
+		    ra->ra_type != REBASE_ACTION_WRITE &&
+		    ra->ra_type != REBASE_ACTION_SEVER)
 			continue;
 		if (rebase_apply_inject_stop_after != 0 &&
 		    applied >= rebase_apply_inject_stop_after) {
 			err = SET_ERROR(EINTR);
 			break;
 		}
-		err = rebase_apply_copy(rs, &rac, ra);
-		if (err != 0) {
-			zfs_dbgmsg("rebase: apply copy %s "
-			    "failed: %d", ra->ra_path, err);
+		if (ra->ra_type == REBASE_ACTION_COPY) {
+			err = rebase_apply_copy(rs, &rac, ra);
+			if (err != 0) {
+				zfs_dbgmsg("rebase: apply copy %s "
+				    "failed: %d", ra->ra_path, err);
+			}
+		} else if (ra->ra_type == REBASE_ACTION_WRITE) {
+			boolean_t wdef = B_FALSE;
+
+			err = rebase_apply_write(rs, &rac, ra,
+			    &wdef);
+			if (err != 0) {
+				zfs_dbgmsg("rebase: apply write %s "
+				    "failed: %d", ra->ra_path, err);
+			} else if (wdef) {
+				writes--;
+				deferred++;
+				continue;
+			}
 		} else {
-			applied++;
+			err = rebase_apply_sever(rs, &rac, ra);
+			if (err != 0) {
+				zfs_dbgmsg("rebase: apply sever %s "
+				    "failed: %d", ra->ra_path, err);
+			}
 		}
+		if (err == 0)
+			applied++;
 	}
 
 	for (ra = list_tail(&rs->rs_manifest.rm_actions);
@@ -6547,9 +7032,11 @@ rebase_apply(rebase_state_t *rs, const char *left_ds)
 	dmu_objset_disown(rac.rac_os, B_FALSE, FTAG);
 
 	if (err == 0) {
-		zfs_dbgmsg("rebase: apply copies %llu unlinks %llu "
-		    "deferred %llu", (u_longlong_t)copies,
-		    (u_longlong_t)unlinks, (u_longlong_t)deferred);
+		zfs_dbgmsg("rebase: apply copies %llu writes %llu "
+		    "severs %llu unlinks %llu deferred %llu",
+		    (u_longlong_t)copies, (u_longlong_t)writes,
+		    (u_longlong_t)severs, (u_longlong_t)unlinks,
+		    (u_longlong_t)deferred);
 	}
 	return (err);
 }
