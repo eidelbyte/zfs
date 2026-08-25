@@ -117,6 +117,17 @@ typedef struct rebase_change {
 
 	uint8_t			rc_dn_type;	/* DMU object type	*/
 
+	/*
+	 * MOVE / MOVE_EDIT only: the base and side directory
+	 * entries are literally identical -- same parent directory
+	 * OBJECT and same leaf name -- so this "move" is a child
+	 * riding its moved parent's ZAP and replays nothing on the
+	 * structural axis. Computed at collapse time, where the
+	 * trees are open; the action compiler is purely in-memory
+	 * and only reads it.
+	 */
+	boolean_t		rc_dirent_same;
+
 	avl_node_t		rc_avl_path;	/* rcl_by_path index	*/
 	avl_node_t		rc_avl_obj;	/* rcl_by_obj index	*/
 } rebase_change_t;
@@ -407,7 +418,14 @@ typedef struct rebase_action {
 	 * trusts it and never re-derives the merge decision.
 	 */
 	boolean_t		ra_frees_object;
+	/*
+	 * Emission sequence number, the tiebreak in apply's
+	 * path-ordered pass index: same-path actions (a LINK and
+	 * its WRITE) keep their emission order.
+	 */
+	uint64_t		ra_seq;
 	list_node_t		ra_node;	/* in rm_actions	*/
+	avl_node_t		ra_avl;		/* apply's pass index	*/
 } rebase_action_t;
 
 /*

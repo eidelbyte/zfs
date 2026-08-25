@@ -2221,6 +2221,71 @@ rebase_move_gen_match(rebase_walk_ctx_t *rwc, int side_slot,
  * a reporting tiebreak only; it never changes whether a collapse
  * happens.
  */
+
+static int rebase_tree_lookup(objset_t *os, uint64_t root,
+    const char *path, uint64_t *objp);
+
+/*
+ * Stamp rc_dirent_same on a freshly collapsed MOVE: are the base
+ * (old path) and side (new path) directory entries literally
+ * identical -- same parent directory OBJECT, same leaf name?
+ * True for every child of a moved directory, whose entry rides
+ * the moved ZAP: there is nothing to replay for it, and an
+ * UNLINK plus LINK pair would EEXIST against the live entry in
+ * one pass and remove it in the other. A rename inside a moved
+ * directory still differs in leaf name and replays normally.
+ * Runs here because the action compiler that consumes the flag
+ * is purely in-memory.
+ */
+static int
+rebase_move_dirent_same(rebase_walk_ctx_t *rwc, int side_slot,
+    rebase_change_t *rc)
+{
+	rebase_state_t *rs = rwc->rwc_rs;
+	char *ppath;
+	const char *oleaf, *nleaf;
+	uint64_t base_par = 0, side_par = 0;
+	size_t plen;
+	int err = 0;
+
+	rc->rc_dirent_same = B_FALSE;
+
+	oleaf = strrchr(rc->rc_old_path, '/');
+	nleaf = strrchr(rc->rc_path, '/');
+	if (oleaf == NULL || nleaf == NULL)
+		return (0);
+	if (strcmp(oleaf + 1, nleaf + 1) != 0)
+		return (0);
+
+	ppath = kmem_alloc(MAXPATHLEN, KM_SLEEP);
+
+	plen = (size_t)(oleaf - rc->rc_old_path);
+	if (plen >= MAXPATHLEN)
+		goto out;
+	memcpy(ppath, rc->rc_old_path, plen);
+	ppath[plen] = '\0';
+	err = rebase_tree_lookup(rwc->rwc_os[REBASE_WALK_BASE],
+	    rs->rs_base_root, ppath, &base_par);
+	if (err != 0 || base_par == 0)
+		goto out;
+
+	plen = (size_t)(nleaf - rc->rc_path);
+	if (plen >= MAXPATHLEN)
+		goto out;
+	memcpy(ppath, rc->rc_path, plen);
+	ppath[plen] = '\0';
+	err = rebase_tree_lookup(rwc->rwc_os[side_slot],
+	    (side_slot == REBASE_WALK_LEFT) ? rs->rs_left_root :
+	    rs->rs_right_root, ppath, &side_par);
+	if (err != 0)
+		goto out;
+
+	rc->rc_dirent_same = (base_par == side_par);
+out:
+	kmem_free(ppath, MAXPATHLEN);
+	return (err);
+}
+
 static int
 rebase_move_collapse_run(rebase_walk_ctx_t *rwc, int side_slot,
     rebase_changelist_t *rcl, rebase_change_t **run, uint_t nrun)
@@ -2298,6 +2363,10 @@ rebase_move_collapse_run(rebase_walk_ctx_t *rwc, int side_slot,
 		kmem_free(best, sizeof (*best));
 		run[bestj] = NULL;
 		rcl->rcl_count--;
+
+		err = rebase_move_dirent_same(rwc, side_slot, add);
+		if (err != 0)
+			return (err);
 
 		if (content_same) {
 			if (side_slot == REBASE_WALK_LEFT)
@@ -4007,6 +4076,7 @@ rebase_action_add(rebase_state_t *rs, rebase_action_type_t type,
 	ra->ra_obj = obj;
 	ra->ra_src = src;
 	ra->ra_src_obj = src_obj;
+	ra->ra_seq = rm->rm_nactions;
 	list_insert_tail(&rm->rm_actions, ra);
 	rm->rm_nactions++;
 	return (ra);
@@ -4692,13 +4762,23 @@ rebase_consistency_sweep(rebase_state_t *rs)
 		uint64_t ed_obj;
 
 		if (rlpg->rlpg_src == REBASE_SRC_RIGHT) {
-			rebase_action_add(rs, REBASE_ACTION_WRITE,
-			    ((rebase_ppath_t *)list_head(
-			    &rlpg->rlpg_members))->rpp_path,
-			    ((rebase_ppath_t *)list_head(
-			    &rlpg->rlpg_members))->rpp_pathlen,
-			    rlpg->rlpg_left_obj, REBASE_SRC_RIGHT,
-			    rlpg->rlpg_right_obj);
+			/*
+			 * A pure-novel group has no left object to
+			 * rewrite: its content rides the full copy
+			 * its first LINK performs, and a WRITE
+			 * here could only ever defer.
+			 */
+			if (rlpg->rlpg_left_obj != 0) {
+				rebase_action_add(rs,
+				    REBASE_ACTION_WRITE,
+				    ((rebase_ppath_t *)list_head(
+				    &rlpg->rlpg_members))->rpp_path,
+				    ((rebase_ppath_t *)list_head(
+				    &rlpg->rlpg_members))->rpp_pathlen,
+				    rlpg->rlpg_left_obj,
+				    REBASE_SRC_RIGHT,
+				    rlpg->rlpg_right_obj);
+			}
 
 			/*
 			 * Right's data lands on paths the left
@@ -4923,14 +5003,28 @@ rebase_consistency_sweep(rebase_state_t *rs)
 		case REBASE_CONTENT_MOVE_EDIT:
 			/*
 			 * A move source's object lives on at the
-			 * destination: never freed here.
+			 * destination: never freed here. The LINK
+			 * targets the moved object itself -- a
+			 * collapsed move keeps its object number,
+			 * so right's number is left's. A move
+			 * whose dirent never changed (a child
+			 * riding its moved parent's ZAP) replays
+			 * nothing structural; a MOVE_EDIT's
+			 * content lands either way.
 			 */
-			rebase_action_add(rs, REBASE_ACTION_UNLINK,
-			    rc->rc_old_path, rc->rc_old_pathlen,
-			    rc->rc_obj, REBASE_SRC_RIGHT, 0);
-			rebase_action_add(rs, REBASE_ACTION_LINK,
-			    rc->rc_path, rc->rc_pathlen, 0,
-			    REBASE_SRC_RIGHT, rc->rc_obj);
+			if (!rc->rc_dirent_same) {
+				rebase_action_add(rs,
+				    REBASE_ACTION_UNLINK,
+				    rc->rc_old_path,
+				    rc->rc_old_pathlen,
+				    rc->rc_obj, REBASE_SRC_RIGHT,
+				    0);
+				rebase_action_add(rs,
+				    REBASE_ACTION_LINK,
+				    rc->rc_path, rc->rc_pathlen,
+				    rc->rc_obj, REBASE_SRC_RIGHT,
+				    rc->rc_obj);
+			}
 			if (rc->rc_content_op ==
 			    REBASE_CONTENT_MOVE_EDIT) {
 				rebase_action_add(rs,
@@ -5603,14 +5697,18 @@ out:
  * right DMU object kind (ZAP for directories, plain file
  * otherwise -- symlinks and devices are plain-file dnodes whose
  * nature lives in their SA attributes) and stamp its attributes
- * from the source. The caller adds the directory entry, copies
- * file data and xattrs, and recurses into directory children.
+ * from the source. keep passes through to the stamp (NULL copies
+ * everything source-valued; the create-on-LINK path pins
+ * ZPL_LINKS to the names actually applied). The caller adds the
+ * directory entry, copies file data and xattrs, and recurses
+ * into directory children.
  */
 static int
 rebase_copy_object(objset_t *src_os, const sa_attr_type_t *src_tbl,
     uint64_t src_obj, objset_t *dst_os,
     const sa_attr_type_t *dst_tbl, uint64_t parent_obj,
-    uint64_t *dst_objp, dmu_tx_t *tx)
+    const rebase_stamp_keep_t *keep, uint64_t *dst_objp,
+    dmu_tx_t *tx)
 {
 	dmu_object_info_t doi;
 	sa_handle_t *dst_hdl;
@@ -5642,7 +5740,7 @@ rebase_copy_object(objset_t *src_os, const sa_attr_type_t *src_tbl,
 	if (err != 0)
 		return (err);
 	err = rebase_stamp_from_source(src_os, src_tbl, src_obj,
-	    dst_hdl, dst_tbl, parent_obj, NULL, tx);
+	    dst_hdl, dst_tbl, parent_obj, keep, tx);
 	sa_handle_destroy(dst_hdl);
 	if (err != 0)
 		return (err);
@@ -6190,7 +6288,8 @@ rebase_apply_copy(rebase_state_t *rs, const rebase_apply_ctx_t *rac,
 	}
 
 	err = rebase_copy_object(src_os, src_sa, ra->ra_src_obj,
-	    rac->rac_os, rac->rac_sa, parent_obj, &new_obj, tx);
+	    rac->rac_os, rac->rac_sa, parent_obj, NULL, &new_obj,
+	    tx);
 	if (err == 0) {
 		dirent = new_obj | (((mode >> 12) & 0xf) << 60);
 		err = zap_add(rac->rac_os, parent_obj, name, 8, 1,
@@ -6857,7 +6956,8 @@ rebase_apply_sever(rebase_state_t *rs, const rebase_apply_ctx_t *rac,
 	}
 
 	err = rebase_copy_object(src_os, src_sa, ra->ra_src_obj,
-	    rac->rac_os, rac->rac_sa, parent_obj, &new_obj, tx);
+	    rac->rac_os, rac->rac_sa, parent_obj, NULL, &new_obj,
+	    tx);
 	if (err == 0) {
 		dirent = new_obj | (((mode >> 12) & 0xf) << 60);
 		err = zap_update(rac->rac_os, parent_obj, name, 8, 1,
@@ -6907,27 +7007,274 @@ rebase_apply_sever(rebase_state_t *rs, const rebase_apply_ctx_t *rac,
 }
 
 /*
- * The apply driver. Pass one applies COPY, WRITE, and SEVER
- * actions in list order -- the emit order puts parents before
- * children and a path's LINK before its WRITE. Pass two applies
- * UNLINK actions in REVERSE list order -- children before
- * parents, so a deleted subtree empties bottom-up and a
- * directory is bare by the time its own entry goes. LINK actions
- * belong to apply-structural and are counted as deferred, and a
- * WRITE whose destination waits on a deferred LINK moves itself
- * into that bucket at run time; the tally line is a stable
- * harness contract. When no applicable action exists the HEAD is
- * not even owned: a pure-diff rebase keeps working against a
- * mounted left until an apply phase actually has work there.
+ * One entry of the per-run map from right-side source objects to
+ * the left objects their first LINK created. Later LINKs of the
+ * same novel group link the created object instead of minting
+ * twins. Member prefix rlm_ = "rebase link map".
+ */
+typedef struct rebase_link_map {
+	uint64_t	rlm_src_obj;
+	uint64_t	rlm_dst_obj;
+	list_node_t	rlm_node;
+} rebase_link_map_t;
+
+/*
+ * Apply one LINK action: add a directory entry for an object
+ * that already exists in the HEAD (nonzero ra_obj: move
+ * destinations, pool joins, matched novel groups) or is minted
+ * right here by full copy from right on a novel group's FIRST
+ * link (ra_obj zero), stamped with ZPL_LINKS 1 -- each later
+ * LINK counts it up, so the total lands at the number of names
+ * actually applied, never right's raw count. Accounting mirrors
+ * apply_unlink's: a non-directory target counts ZPL_LINKS up; a
+ * directory target (a moved directory arriving at its new name)
+ * never touches its own count, but the new parent gains a link
+ * -- the old parent lost one in the unlink. ZPL_PARENT updates
+ * best-effort: a multi-link file has no single parent truth by
+ * design, and the linkpool table stays authoritative.
+ */
+static int
+rebase_apply_link(rebase_state_t *rs, const rebase_apply_ctx_t *rac,
+    const rebase_action_t *ra, list_t *made)
+{
+	objset_t *src_os = rs->rs_right_os;
+	const sa_attr_type_t *src_sa = rs->rs_right_sa;
+	sa_handle_t *par_hdl, *obj_hdl = NULL, *mode_hdl;
+	dmu_object_info_t doi;
+	rebase_stamp_keep_t keep;
+	dmu_tx_t *tx;
+	const char *name;
+	rebase_link_map_t *rlm;
+	uint64_t parent_obj, target, val, mode, links, dirent, one;
+	uint64_t psize, plinks, times[2];
+	inode_timespec_t now;
+	boolean_t is_dir, create;
+	int err;
+
+	err = rebase_apply_parent(rac, ra->ra_path, &parent_obj,
+	    &name);
+	if (err != 0)
+		return (err);
+
+	/* The merge said this name is free; verify it. */
+	err = zap_lookup(rac->rac_os, parent_obj, name, 8, 1, &val);
+	if (err == 0) {
+		zfs_dbgmsg("rebase: apply destination exists: %s",
+		    ra->ra_path);
+		return (SET_ERROR(EEXIST));
+	}
+	if (err != ENOENT)
+		return (err);
+
+	target = ra->ra_obj;
+	if (target == 0) {
+		for (rlm = list_head(made); rlm != NULL;
+		    rlm = list_next(made, rlm)) {
+			if (rlm->rlm_src_obj == ra->ra_src_obj) {
+				target = rlm->rlm_dst_obj;
+				break;
+			}
+		}
+	}
+	create = (target == 0);
+
+	if (create) {
+		if (ra->ra_src_obj == 0) {
+			zfs_dbgmsg("rebase: apply link %s has no "
+			    "source", ra->ra_path);
+			return (SET_ERROR(EIO));
+		}
+		err = dmu_object_info(src_os, ra->ra_src_obj, &doi);
+		if (err != 0)
+			return (err);
+	} else {
+		err = dmu_object_info(rac->rac_os, target, &doi);
+		if (err != 0) {
+			zfs_dbgmsg("rebase: apply link target "
+			    "missing: %s", ra->ra_path);
+			return (SET_ERROR(EIO));
+		}
+	}
+	is_dir = (doi.doi_type == DMU_OT_DIRECTORY_CONTENTS);
+
+	/* The dirent type nibble comes from the linked object. */
+	err = sa_handle_get(create ? src_os : rac->rac_os,
+	    create ? ra->ra_src_obj : target, NULL, SA_HDL_PRIVATE,
+	    &mode_hdl);
+	if (err != 0)
+		return (err);
+	err = sa_lookup(mode_hdl,
+	    create ? src_sa[ZPL_MODE] : rac->rac_sa[ZPL_MODE],
+	    &mode, sizeof (mode));
+	sa_handle_destroy(mode_hdl);
+	if (err != 0)
+		return (err);
+
+	err = sa_handle_get(rac->rac_os, parent_obj, NULL,
+	    SA_HDL_PRIVATE, &par_hdl);
+	if (err != 0)
+		return (err);
+	if (!create) {
+		err = sa_handle_get(rac->rac_os, target, NULL,
+		    SA_HDL_PRIVATE, &obj_hdl);
+		if (err != 0) {
+			sa_handle_destroy(par_hdl);
+			return (err);
+		}
+	}
+
+	tx = dmu_tx_create(rac->rac_os);
+	dmu_tx_hold_zap(tx, parent_obj, B_TRUE, name);
+	dmu_tx_hold_sa(tx, par_hdl, B_FALSE);
+	if (create) {
+		dmu_tx_hold_sa_create(tx,
+		    DN_BONUS_SIZE(DNODE_MIN_SIZE));
+		if (is_dir)
+			dmu_tx_hold_zap(tx, DMU_NEW_OBJECT, B_TRUE,
+			    NULL);
+	} else {
+		dmu_tx_hold_sa(tx, obj_hdl, B_FALSE);
+	}
+	err = dmu_tx_assign(tx, DMU_TX_WAIT);
+	if (err != 0) {
+		dmu_tx_abort(tx);
+		goto out;
+	}
+
+	if (create) {
+		one = 1;
+		memset(&keep, 0, sizeof (keep));
+		keep.rsk_links = &one;
+		err = rebase_copy_object(src_os, src_sa,
+		    ra->ra_src_obj, rac->rac_os, rac->rac_sa,
+		    parent_obj, &keep, &target, tx);
+	} else {
+		if (!is_dir) {
+			err = sa_lookup(obj_hdl,
+			    rac->rac_sa[ZPL_LINKS], &links,
+			    sizeof (links));
+			if (err == 0) {
+				links++;
+				err = sa_update(obj_hdl,
+				    rac->rac_sa[ZPL_LINKS], &links,
+				    sizeof (links), tx);
+			}
+		}
+		if (err == 0) {
+			err = sa_update(obj_hdl,
+			    rac->rac_sa[ZPL_PARENT], &parent_obj,
+			    sizeof (parent_obj), tx);
+		}
+	}
+	if (err == 0) {
+		dirent = target | (((mode >> 12) & 0xf) << 60);
+		err = zap_add(rac->rac_os, parent_obj, name, 8, 1,
+		    &dirent, tx);
+	}
+
+	/* Parent bookkeeping, as the ZPL link path leaves it. */
+	if (err == 0) {
+		psize = 0;
+		err = sa_lookup(par_hdl, rac->rac_sa[ZPL_SIZE],
+		    &psize, sizeof (psize));
+		if (err == 0) {
+			psize++;
+			err = sa_update(par_hdl,
+			    rac->rac_sa[ZPL_SIZE], &psize,
+			    sizeof (psize), tx);
+		}
+	}
+	if (err == 0 && is_dir) {
+		plinks = 0;
+		err = sa_lookup(par_hdl, rac->rac_sa[ZPL_LINKS],
+		    &plinks, sizeof (plinks));
+		if (err == 0) {
+			plinks++;
+			err = sa_update(par_hdl,
+			    rac->rac_sa[ZPL_LINKS], &plinks,
+			    sizeof (plinks), tx);
+		}
+	}
+	if (err == 0) {
+		gethrestime(&now);
+		REBASE_TIME_ENCODE(&now, times);
+		err = sa_update(par_hdl, rac->rac_sa[ZPL_MTIME],
+		    times, sizeof (times), tx);
+		if (err == 0)
+			err = sa_update(par_hdl,
+			    rac->rac_sa[ZPL_CTIME], times,
+			    sizeof (times), tx);
+	}
+
+	dmu_tx_commit(tx);
+
+	if (err == 0 && create) {
+		err = rebase_copy_data(src_os, ra->ra_src_obj,
+		    rac->rac_os, target);
+		if (err == 0)
+			err = rebase_copy_xattrs(src_os, src_sa,
+			    ra->ra_src_obj, rac->rac_os,
+			    rac->rac_sa, target,
+			    rac->rac_xattr_mode);
+		if (err == 0) {
+			rlm = kmem_zalloc(sizeof (*rlm), KM_SLEEP);
+			rlm->rlm_src_obj = ra->ra_src_obj;
+			rlm->rlm_dst_obj = target;
+			list_insert_tail(made, rlm);
+		}
+	}
+out:
+	if (obj_hdl != NULL)
+		sa_handle_destroy(obj_hdl);
+	sa_handle_destroy(par_hdl);
+	return (err);
+}
+
+/*
+ * Sort for the apply pass index: path order puts parents before
+ * children (a parent path is a strict prefix, and prefixes sort
+ * first), and the emission sequence breaks same-path ties (a
+ * path's LINK precedes its WRITE).
+ */
+static int
+rebase_action_cmp(const void *a, const void *b)
+{
+	const rebase_action_t *ra = a;
+	const rebase_action_t *rb = b;
+	int c = strcmp(ra->ra_path, rb->ra_path);
+
+	if (c != 0)
+		return (c > 0 ? 1 : -1);
+	return (TREE_CMP(ra->ra_seq, rb->ra_seq));
+}
+
+/*
+ * The apply driver. Both passes walk a PATH-ORDERED index of the
+ * action list, never the raw list: the emission loops interleave
+ * (groups, member rows, standalones), and only global path order
+ * gives pass one parents-before-children (a novel pool's LINKs
+ * must follow the COPY of the directory created around them) and
+ * pass two, walked backward, children-before-parents (a pool
+ * member's unlink must precede its deleted parent directory's).
+ * Pass one applies COPY, WRITE, SEVER, and LINK; pass two applies
+ * UNLINK. The tally line is a stable harness contract; deferred
+ * counts action types no apply phase owns yet. When no applicable
+ * action exists the HEAD is not even owned: a pure-diff rebase
+ * keeps working against a mounted left until an apply phase
+ * actually has work there.
  */
 static int
 rebase_apply(rebase_state_t *rs, const char *left_ds)
 {
 	rebase_apply_ctx_t rac;
 	rebase_action_t *ra;
-	uint64_t copies = 0, writes = 0, severs = 0, unlinks = 0;
-	uint64_t deferred = 0;
+	rebase_link_map_t *rlm;
+	avl_tree_t order;
+	list_t made;
+	uint64_t copies = 0, writes = 0, severs = 0, links = 0;
+	uint64_t unlinks = 0, deferred = 0;
 	uint64_t applied = 0;
+	void *cookie;
 	int err;
 
 	for (ra = list_head(&rs->rs_manifest.rm_actions); ra != NULL;
@@ -6938,14 +7285,16 @@ rebase_apply(rebase_state_t *rs, const char *left_ds)
 			writes++;
 		else if (ra->ra_type == REBASE_ACTION_SEVER)
 			severs++;
+		else if (ra->ra_type == REBASE_ACTION_LINK)
+			links++;
 		else if (ra->ra_type == REBASE_ACTION_UNLINK)
 			unlinks++;
 		else
 			deferred++;
 	}
-	if (copies + writes + severs + unlinks == 0) {
+	if (copies + writes + severs + links + unlinks == 0) {
 		zfs_dbgmsg("rebase: apply copies 0 writes 0 "
-		    "severs 0 unlinks 0 deferred %llu",
+		    "severs 0 links 0 unlinks 0 deferred %llu",
 		    (u_longlong_t)deferred);
 		return (0);
 	}
@@ -6968,12 +7317,21 @@ rebase_apply(rebase_state_t *rs, const char *left_ds)
 	if (err != 0)
 		zfs_dbgmsg("rebase: apply setup failed: %d", err);
 
-	for (ra = list_head(&rs->rs_manifest.rm_actions);
-	    err == 0 && ra != NULL;
-	    ra = list_next(&rs->rs_manifest.rm_actions, ra)) {
+	avl_create(&order, rebase_action_cmp,
+	    sizeof (rebase_action_t),
+	    offsetof(rebase_action_t, ra_avl));
+	for (ra = list_head(&rs->rs_manifest.rm_actions); ra != NULL;
+	    ra = list_next(&rs->rs_manifest.rm_actions, ra))
+		avl_add(&order, ra);
+	list_create(&made, sizeof (rebase_link_map_t),
+	    offsetof(rebase_link_map_t, rlm_node));
+
+	for (ra = avl_first(&order); err == 0 && ra != NULL;
+	    ra = AVL_NEXT(&order, ra)) {
 		if (ra->ra_type != REBASE_ACTION_COPY &&
 		    ra->ra_type != REBASE_ACTION_WRITE &&
-		    ra->ra_type != REBASE_ACTION_SEVER)
+		    ra->ra_type != REBASE_ACTION_SEVER &&
+		    ra->ra_type != REBASE_ACTION_LINK)
 			continue;
 		if (rebase_apply_inject_stop_after != 0 &&
 		    applied >= rebase_apply_inject_stop_after) {
@@ -6999,6 +7357,13 @@ rebase_apply(rebase_state_t *rs, const char *left_ds)
 				deferred++;
 				continue;
 			}
+		} else if (ra->ra_type == REBASE_ACTION_LINK) {
+			err = rebase_apply_link(rs, &rac, ra,
+			    &made);
+			if (err != 0) {
+				zfs_dbgmsg("rebase: apply link %s "
+				    "failed: %d", ra->ra_path, err);
+			}
 		} else {
 			err = rebase_apply_sever(rs, &rac, ra);
 			if (err != 0) {
@@ -7010,9 +7375,8 @@ rebase_apply(rebase_state_t *rs, const char *left_ds)
 			applied++;
 	}
 
-	for (ra = list_tail(&rs->rs_manifest.rm_actions);
-	    err == 0 && ra != NULL;
-	    ra = list_prev(&rs->rs_manifest.rm_actions, ra)) {
+	for (ra = avl_last(&order); err == 0 && ra != NULL;
+	    ra = AVL_PREV(&order, ra)) {
 		if (ra->ra_type != REBASE_ACTION_UNLINK)
 			continue;
 		if (rebase_apply_inject_stop_after != 0 &&
@@ -7029,14 +7393,23 @@ rebase_apply(rebase_state_t *rs, const char *left_ds)
 		}
 	}
 
+	while ((rlm = list_remove_head(&made)) != NULL)
+		kmem_free(rlm, sizeof (*rlm));
+	list_destroy(&made);
+	cookie = NULL;
+	while (avl_destroy_nodes(&order, &cookie) != NULL)
+		continue;
+	avl_destroy(&order);
+
 	dmu_objset_disown(rac.rac_os, B_FALSE, FTAG);
 
 	if (err == 0) {
 		zfs_dbgmsg("rebase: apply copies %llu writes %llu "
-		    "severs %llu unlinks %llu deferred %llu",
+		    "severs %llu links %llu unlinks %llu "
+		    "deferred %llu",
 		    (u_longlong_t)copies, (u_longlong_t)writes,
-		    (u_longlong_t)severs, (u_longlong_t)unlinks,
-		    (u_longlong_t)deferred);
+		    (u_longlong_t)severs, (u_longlong_t)links,
+		    (u_longlong_t)unlinks, (u_longlong_t)deferred);
 	}
 	return (err);
 }
