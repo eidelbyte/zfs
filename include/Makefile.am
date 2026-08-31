@@ -60,6 +60,7 @@ COMMON_H = \
 	sys/dsl_dir.h \
 	sys/dsl_pool.h \
 	sys/dsl_prop.h \
+	sys/dsl_rebase.h \
 	sys/dsl_scan.h \
 	sys/dsl_synctask.h \
 	sys/dsl_userhold.h \
