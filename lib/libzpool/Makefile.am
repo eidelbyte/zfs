@@ -112,6 +112,10 @@ nodist_libzpool_la_SOURCES = \
 	module/zfs/dsl_dir.c \
 	module/zfs/dsl_pool.c \
 	module/zfs/dsl_prop.c \
+	module/zfs/dsl_rebase.c \
+	module/zfs/dsl_rebase_apply.c \
+	module/zfs/dsl_rebase_decide.c \
+	module/zfs/dsl_rebase_emit.c \
 	module/zfs/dsl_scan.c \
 	module/zfs/dsl_synctask.c \
 	module/zfs/dsl_userhold.c \
