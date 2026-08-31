@@ -37,10 +37,15 @@
 #include <sys/zfs_context.h>
 #include <sys/dsl_rebase.h>
 #include <sys/dsl_dataset.h>
+#include <sys/dsl_dir.h>
 #include <sys/dsl_pool.h>
+#include <sys/dsl_scan.h>
 #include <sys/dmu.h>
+#include <sys/dmu_objset.h>
 #include <sys/spa.h>
 #include <sys/nvpair.h>
+#include <sys/zap.h>
+#include <sys/zfs_znode.h>
 
 /*
  * Memory cap for one decide run's arena, in bytes; 0 means the
@@ -203,11 +208,146 @@ rebase_find_common(dsl_pool_t *dp, dsl_dataset_t *left,
 	return (SET_ERROR(ENOENT));
 }
 
+static int
+rebase_master_lookup(objset_t *os, const char *key, uint64_t *valp)
+{
+	return (zap_lookup(os, MASTER_NODE_OBJ, key, 8, 1, valp));
+}
+
+/*
+ * The ZPL properties that define name semantics. If any of these
+ * differ between the three datasets, "same name" is not
+ * well-defined and no phase of the engine may run.
+ */
+static const zfs_prop_t rebase_name_props[] = {
+	ZFS_PROP_CASE,
+	ZFS_PROP_NORMALIZE,
+	ZFS_PROP_UTF8ONLY,
+};
+
+/*
+ * Validate preconditions for a rebase operation.
+ *
+ * Checks (all three datasets are held, objsets opened):
+ *   1. Common ancestor exists (already verified by find_common)
+ *   2. All three objsets are ZPL filesystems -- everything below
+ *      reads MASTER_NODE, and a zvol argument would trip debug
+ *      assertions before returning cleanly
+ *   3. No scrub or resilver engaged
+ *   4. Encryption compatibility (both sides encrypted or both not)
+ *   5. ZPL version >= 5 on all three (SA layout required)
+ *   6. FUID table object identical across all three
+ *   7. Name semantics (casesensitivity, normalization, utf8only)
+ *      equal across all three, and restricted to casesensitivity =
+ *      sensitive with normalization = none: the engine matches
+ *      names byte-exactly, which is only correct when every name
+ *      has exactly one stored form
+ *
+ * Not checked (by design):
+ *   - User holds: rebase only adds history after the left tip,
+ *     never rewrites existing snapshots, so holds are harmless.
+ *   - Right-side clones/snapshots: rebase only reads from the
+ *     right side, never mutates it.  Clones of intermediate
+ *     snapshots are unaffected.
+ *   - Dedup: transparent at the DMU level.
+ *   - SA layout: sa_setup() handles per-objset differences.
+ */
+static int
+rebase_check_preconditions(dsl_pool_t *dp, dsl_dataset_t *left,
+    dsl_dataset_t *right, objset_t *left_os, objset_t *right_os,
+    objset_t *base_os)
+{
+	objset_t *oss[3];
+	uint64_t vals[3];
+	uint64_t v;
+	int err;
+
+	oss[0] = left_os;
+	oss[1] = right_os;
+	oss[2] = base_os;
+
+	/* (2) All three must be ZPL filesystems. */
+	for (int i = 0; i < 3; i++) {
+		if (dmu_objset_type(oss[i]) != DMU_OST_ZFS)
+			return (SET_ERROR(ENOTSUP));
+	}
+
+	/*
+	 * (3) Scrub or resilver in progress. The predicate is the
+	 * scan state machine being engaged -- dsl_scan_scrubbing()
+	 * counts a PAUSED scrub too, which is still a scrub in
+	 * progress -- and deliberately NOT dsl_scan_active(), which
+	 * would miss paused scrubs while spuriously tripping on
+	 * background cleanup a rebase does not conflict with (async
+	 * destroys, pending frees, livelist deletes).
+	 */
+	if (dsl_scan_scrubbing(dp) || dsl_scan_resilvering(dp))
+		return (SET_ERROR(EBUSY));
+
+	/* (4) Encryption -- both sides must agree. */
+	if ((left->ds_dir->dd_crypto_obj == 0) !=
+	    (right->ds_dir->dd_crypto_obj == 0))
+		return (SET_ERROR(EACCES));
+
+	/* (5) ZPL >= 5 (SA layout required) on all three. */
+	for (int i = 0; i < 3; i++) {
+		err = zfs_get_zplprop(oss[i], ZFS_PROP_VERSION, &v);
+		if (err != 0)
+			return (err);
+		if (v < ZPL_VERSION_SA)
+			return (SET_ERROR(ENOTSUP));
+	}
+
+	/* (6) FUID table object must match across all three. */
+	for (int i = 0; i < 3; i++) {
+		vals[i] = 0;
+		(void) rebase_master_lookup(oss[i], ZFS_FUID_TABLES,
+		    &vals[i]);
+	}
+	if (vals[0] != vals[1] || vals[0] != vals[2])
+		return (SET_ERROR(ENOTSUP));
+
+	/*
+	 * (7) Name semantics must match across all three.
+	 * zfs_get_zplprop reads the MASTER_NODE ZAP (or the objset
+	 * cache) and supplies the creation default when a key was
+	 * never written, so a filesystem created before one of these
+	 * properties existed compares correctly against one carrying
+	 * an explicit default.
+	 */
+	for (size_t p = 0; p < ARRAY_SIZE(rebase_name_props); p++) {
+		for (int i = 0; i < 3; i++) {
+			err = zfs_get_zplprop(oss[i],
+			    rebase_name_props[p], &vals[i]);
+			if (err != 0)
+				return (err);
+		}
+		if (vals[0] != vals[1] || vals[0] != vals[2])
+			return (SET_ERROR(ENOTSUP));
+
+		/*
+		 * Byte-exact name matching requires one stored form
+		 * per name: case-insensitive or normalizing datasets
+		 * can store the same logical name under different
+		 * bytes (e.g. a rename that only changes case).
+		 */
+		if (rebase_name_props[p] == ZFS_PROP_CASE &&
+		    vals[0] != ZFS_CASE_SENSITIVE)
+			return (SET_ERROR(ENOTSUP));
+		if (rebase_name_props[p] == ZFS_PROP_NORMALIZE &&
+		    vals[0] != 0)
+			return (SET_ERROR(ENOTSUP));
+	}
+
+	return (0);
+}
+
 int
 dsl_rebase(const char *left_ds, const char *right_ds, nvlist_t *outnvl)
 {
 	dsl_pool_t *dp;
 	dsl_dataset_t *left, *right, *base;
+	objset_t *left_os, *right_os, *base_os;
 	int err;
 
 	(void) outnvl;
@@ -255,12 +395,33 @@ dsl_rebase(const char *left_ds, const char *right_ds, nvlist_t *outnvl)
 		goto rele_both;
 
 	/*
-	 * Common ancestor found and held.  Subsequent issues add
-	 * preconditions, fence posts and long holds, the walk, the
-	 * decide passes, emission, and the manifest.
+	 * Borrowed objset pointers: dmu_objset_from_ds carries no
+	 * separate hold, so these live exactly as long as the
+	 * dataset holds above.
+	 */
+	err = dmu_objset_from_ds(left, &left_os);
+	if (err != 0)
+		goto rele_base;
+	err = dmu_objset_from_ds(right, &right_os);
+	if (err != 0)
+		goto rele_base;
+	err = dmu_objset_from_ds(base, &base_os);
+	if (err != 0)
+		goto rele_base;
+
+	err = rebase_check_preconditions(dp, left, right,
+	    left_os, right_os, base_os);
+	if (err != 0)
+		goto rele_base;
+
+	/*
+	 * Preconditions hold.  Subsequent issues add fence posts and
+	 * long holds, the walk, the decide passes, emission, and the
+	 * manifest.
 	 */
 	err = SET_ERROR(ENOSYS);
 
+rele_base:
 	dsl_dataset_rele(base, FTAG);
 rele_both:
 	dsl_dataset_rele(right, FTAG);
